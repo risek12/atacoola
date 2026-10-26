@@ -1,2 +1,14 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Одинаковые переносы строк у всех (Windows, Mac, Linux) — иначе Git показывает лишние изменения
+* text=auto eol=lf
+
+# Картинки, звуки и шрифты — двоичные файлы, их не сравнивают построчно
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.svg binary
+*.wav binary
+*.ogg binary
+*.mp3 binary
+*.ttf binary
+*.otf binary
