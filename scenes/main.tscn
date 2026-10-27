@@ -45,8 +45,29 @@ text = "Монеты: 0"
 horizontal_alignment = 2
 vertical_alignment = 1
 
+[node name="RocketsLabel" type="Label" parent="HUD"]
+offset_left = 24.0
+offset_top = 30.0
+offset_right = 420.0
+offset_bottom = 96.0
+theme_override_colors/font_color = Color(1, 0.6, 0.3, 1)
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 9
+theme_override_font_sizes/font_size = 39
+text = "Ракеты: 0/3"
+vertical_alignment = 1
+
 [node name="UI" type="CanvasLayer" parent="."]
 follow_viewport_enabled = true
+
+[node name="RocketButton" type="Button" parent="UI"]
+visible = false
+offset_left = 680.0
+offset_top = 1641.0
+offset_right = 940.0
+offset_bottom = 1716.0
+theme_override_font_sizes/font_size = 32
+text = "Ракета −500"
 
 [node name="BombButton" type="Button" parent="UI"]
 visible = false
@@ -57,10 +78,12 @@ offset_bottom = 1716.0
 theme_override_font_sizes/font_size = 36
 text = "Бомба −40"
 
-[node name="CountdownLabel" type="Label" parent="UI"]
-offset_top = 690.0
-offset_right = 1080.0
-offset_bottom = 990.0
+[node name="CountdownLabel" type="Label" parent="HUD"]
+anchor_top = 0.5
+anchor_right = 1.0
+anchor_bottom = 0.5
+offset_top = -270.0
+offset_bottom = 30.0
 theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
 theme_override_constants/outline_size = 21
 theme_override_font_sizes/font_size = 165
@@ -68,14 +91,18 @@ text = "3"
 horizontal_alignment = 1
 vertical_alignment = 1
 
-[node name="ResultPanel" type="Panel" parent="UI"]
+[node name="ResultPanel" type="Panel" parent="HUD"]
 visible = false
-offset_left = 90.0
-offset_top = 300.0
-offset_right = 990.0
-offset_bottom = 1230.0
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -450.0
+offset_top = -660.0
+offset_right = 450.0
+offset_bottom = 270.0
 
-[node name="ResultLabel" type="Label" parent="UI/ResultPanel"]
+[node name="ResultLabel" type="Label" parent="HUD/ResultPanel"]
 offset_left = 45.0
 offset_top = 45.0
 offset_right = 855.0
@@ -84,7 +111,7 @@ theme_override_font_sizes/font_size = 45
 text = "ИТОГИ РАУНДА"
 horizontal_alignment = 1
 
-[node name="RestartButton" type="Button" parent="UI/ResultPanel"]
+[node name="RestartButton" type="Button" parent="HUD/ResultPanel"]
 offset_left = 225.0
 offset_top = 735.0
 offset_right = 675.0

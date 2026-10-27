@@ -5,6 +5,7 @@ const C = preload("res://scripts/cfg.gd")
 const SurferScript = preload("res://scripts/surfer.gd")
 const SharkScript = preload("res://scripts/shark.gd")
 const ChestScript = preload("res://scripts/chest.gd")
+const BigSharkScript = preload("res://scripts/big_shark.gd")
 
 enum State { COUNTDOWN, PLAYING, RESULTS }
 
@@ -15,20 +16,37 @@ var round_time := 0.0
 var difficulty := 0.0  # 0 — начало раунда, 1 — пик (см. DIFFICULTY_PEAK_TIME)
 var points_rate := 1.0  # базовая ставка очков/с, растёт за матч (см. POINTS_RATE)
 var aiming := false         # игрок нажал «Бомба» и выбирает, куда её сбросить
-var aim_pos := Vector2.ZERO # куда сейчас наведён прицел
+var aim_pos := Vector2.ZERO # куда сейчас наведён прицел (координаты поля)
+var aim_screen := Vector2.ZERO  # где прицел на экране (палец/мышь)
 var aim_shown := false      # прицел уже наводили (мышью или пальцем) — можно рисовать круг
 var aim_held := false       # палец на экране: бомба упадёт, когда его отпустят
+var touch_down := false     # палец на экране (управление серфером)
+var touch_start := Vector2.ZERO  # где палец коснулся экрана (для свайпа)
+var touch_time := 0.0       # когда коснулся
+var swiped := false         # в этом касании уже был свайп
+var touch_on_beach := false # касание пришлось на пляж (нижнюю полосу), пока серфер в воде
 var bombs: Array = []       # летящие бомбы: {target: Vector2, t: float}
+var tornadoes: Array = []   # торнадо на полосе: {x, dir, warn} — warn > 0: ещё мигает стрелка у края
+var tornado_timer := 0.0    # сколько осталось до следующего торнадо
+var big_shark: Node2D = null  # большая акула (не больше одной за раз)
+var big_shark_timer := 0.0
+var strikes: Array = []     # молнии: {target, t} — t растёт до LIGHTNING_WARN, потом удар
+var flashes: Array = []     # следы ударов для отрисовки: {target, life}
+var lightning_timer := 0.0
 var gold_times: Array = []  # когда (секунда раунда) появятся золотые зоны
 var gold_timer := 0.0       # > 0 — золотая зона активна, столько секунд ей осталось
 var gold_off := 0.0         # верх золотой зоны: на сколько пикселей ниже вала
 var wall_y := C.WALL_START_Y
 var zone_y: Array = []  # границы зон по Y (см. _update_zones)
+var cam_scroll := 0.0   # на сколько px камера поднята над пляжем (см. _fit_to_screen)
+var view_top := 0.0     # верх экрана в координатах поля
 var time_passed := 0.0
 var surfers: Array = []
 var sharks: Array = []
-var chest: Node2D = null
+var pickups: Array = []      # предметы на воде: сундуки и кубки
 var chest_timer := 12.0
+var trophy_timer := 12.0
+var rocket_shots: Array = [] # летящие ракеты: {pos, dir, owner}
 var shark_timer := 1.5
 var death_marks: Array = []  # метки гибели: {lane, x, off} — off = на сколько ниже вала (едут вместе с ним)
 var floaters: Array = []  # всплывающие надписи "+30", "Ам!"
@@ -38,16 +56,19 @@ var winner_lane := -1
 var coins := 0
 var player: Node2D
 var overlay: Node2D
+var beach_layer: Node2D
 var font: Font
 
-@onready var countdown_label: Label = $UI/CountdownLabel
+@onready var countdown_label: Label = $HUD/CountdownLabel
 @onready var timer_label: Label = $HUD/TimerLabel
 @onready var coins_label: Label = $HUD/CoinsLabel
 @onready var rate_label: Label = $HUD/RateLabel
 @onready var bomb_button: Button = $UI/BombButton
-@onready var result_panel: Control = $UI/ResultPanel
-@onready var result_label: Label = $UI/ResultPanel/ResultLabel
-@onready var restart_button: Button = $UI/ResultPanel/RestartButton
+@onready var rocket_button: Button = $UI/RocketButton
+@onready var rockets_label: Label = $HUD/RocketsLabel
+@onready var result_panel: Control = $HUD/ResultPanel
+@onready var result_label: Label = $HUD/ResultPanel/ResultLabel
+@onready var restart_button: Button = $HUD/ResultPanel/RestartButton
 
 
 func _ready() -> void:
@@ -56,8 +77,13 @@ func _ready() -> void:
 	overlay.z_index = 10
 	add_child(overlay)
 	overlay.draw.connect(_draw_overlay)
+	beach_layer = Node2D.new()
+	beach_layer.z_index = 5  # над морем, акулами и плывущими серферами; серферы на пляже — ещё выше
+	add_child(beach_layer)
+	beach_layer.draw.connect(_draw_beach)
 	restart_button.pressed.connect(start_round)
 	bomb_button.pressed.connect(_on_bomb_button)
+	rocket_button.pressed.connect(_on_buy_rocket)
 	_load_coins()
 	start_round()
 
@@ -67,9 +93,10 @@ func start_round() -> void:
 		s.queue_free()
 	for sh in sharks:
 		sh.queue_free()
-	if chest:
-		chest.queue_free()
-		chest = null
+	for pk in pickups:
+		pk.queue_free()
+	pickups.clear()
+	rocket_shots.clear()
 	surfers.clear()
 	sharks.clear()
 	death_marks.clear()
@@ -91,10 +118,21 @@ func start_round() -> void:
 	_schedule_gold()
 	aiming = false
 	bombs.clear()
+	tornadoes.clear()
+	tornado_timer = C.TORNADO_FIRST_DELAY
+	if big_shark:
+		big_shark.queue_free()
+		big_shark = null
+	big_shark_timer = C.BIG_SHARK_FIRST_DELAY
+	strikes.clear()
+	flashes.clear()
+	lightning_timer = C.LIGHTNING_FIRST_DELAY
 	wall_y = C.WALL_START_Y
+	cam_scroll = 0.0
 	_update_zones()
 	shark_timer = 0.3
 	chest_timer = randf_range(C.CHEST_FIRST_DELAY[0], C.CHEST_FIRST_DELAY[1])
+	trophy_timer = randf_range(C.TROPHY_FIRST_DELAY[0], C.TROPHY_FIRST_DELAY[1])
 	winner_lane = -1
 	state = State.COUNTDOWN
 	countdown = 3.0
@@ -124,13 +162,17 @@ func _process(delta: float) -> void:
 		if message_timer <= 0.0 and state == State.PLAYING:
 			countdown_label.hide()
 
-	_fit_to_screen()
+	_fit_to_screen(delta)
 	_update_effects(delta)
 	timer_label.text = "%d" % ceili(C.ROUND_TIME - round_time)
 	rate_label.text = "Очки ×%.1f" % points_rate
 	_update_bomb_button()
 	queue_redraw()
+	beach_layer.queue_redraw()
 	overlay.queue_redraw()
+	bomb_button.position.y = 1641.0 + beach_dy()  # кнопки едут вместе с пляжем
+	rocket_button.position.y = 1641.0 + beach_dy()
+	_update_rocket_ui()
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -141,22 +183,55 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if not player.is_alive():
 		return
-	# На телефоне касание пальцем приходит как нажатие левой кнопки мыши.
+	# На телефоне касание пальцем приходит как нажатие левой кнопки мыши, а ведение пальцем — как движение мыши.
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		if event.pressed:
 			var p: Vector2 = (make_input_local(event) as InputEventMouseButton).position
-			if chest and chest.visible and p.distance_to(chest.position) < 90.0:
-				_give_chest(player)
-				return
-			player.press()
+			for pk in pickups:
+				if pk.visible and p.distance_to(pk.position) < 90.0:
+					_collect(pk, player)
+					return
+			touch_down = true
+			touch_start = event.position
+			touch_time = time_passed
+			swiped = false
+			touch_on_beach = player.in_water() and p.y > C.SHORE_Y + beach_dy()
+			if touch_on_beach:
+				player.press_back()  # палец на пляже — к берегу
+			else:
+				player.press()       # палец на море — к валу (на пляже — бег к воде)
 		else:
+			touch_down = false
 			player.release()
-	elif event is InputEventKey and event.keycode == KEY_SPACE and not event.echo:
-		# пробел — для проверки на компьютере
-		if event.pressed:
-			player.press()
-		else:
-			player.release()
+	elif event is InputEventMouseMotion and touch_down and not swiped:
+		# свайп: быстро провёл пальцем вверх/вниз — рывок, влево/вправо — ракета
+		var d: Vector2 = event.position - touch_start
+		if time_passed - touch_time <= C.SWIPE_MAX_TIME:
+			if absf(d.y) >= C.SWIPE_MIN_DIST and absf(d.y) > absf(d.x):
+				swiped = true
+				if d.y < 0.0:
+					player.dash(-1.0)  # вверх — рывок вперёд
+				else:
+					player.dash(1.0)   # вниз — рывок назад
+					player.release()   # и больше не гребём вперёд
+			elif absf(d.x) >= C.SWIPE_MIN_DIST and absf(d.x) > absf(d.y):
+				swiped = true
+				_fire_rocket(player, signf(d.x))
+	elif event is InputEventKey and not event.echo:
+		# клавиатура — для проверки на компьютере: пробел — плыть, ↑/W и ↓/S — рывки, ←/A и →/D — ракеты
+		if event.keycode == KEY_SPACE:
+			if event.pressed:
+				player.press()
+			else:
+				player.release()
+		elif event.pressed and (event.keycode == KEY_UP or event.keycode == KEY_W):
+			player.dash(-1.0)
+		elif event.pressed and (event.keycode == KEY_DOWN or event.keycode == KEY_S):
+			player.dash(1.0)
+		elif event.pressed and (event.keycode == KEY_LEFT or event.keycode == KEY_A):
+			_fire_rocket(player, -1.0)
+		elif event.pressed and (event.keycode == KEY_RIGHT or event.keycode == KEY_D):
+			_fire_rocket(player, 1.0)
 
 
 # ---------------- Раунд ----------------
@@ -181,10 +256,14 @@ func _update_round(delta: float) -> void:
 			sh.queue_free()
 
 	_update_gold(delta)
+	_update_tornadoes(delta, progress)
+	_update_big_shark(delta)
+	_update_lightning(delta)
 	_update_bombs(delta)
 	_spawn_sharks(delta)
 	_check_bites()
-	_update_chest(delta)
+	_update_pickups(delta)
+	_update_rockets(delta)
 
 	if progress >= 1.0 or surfers.all(func(s): return s.is_out()):
 		_end_round()
@@ -198,8 +277,7 @@ func _update_zones() -> void:
 	zone_y[C.ZONES] = wall_y
 	var y := wall_y
 	for i in range(C.ZONES - 1, -1, -1):
-		var start_height: float = (C.SHORE_Y - C.WALL_START_Y) * (C.ZONE_BOUNDS[i + 1] - C.ZONE_BOUNDS[i])
-		y = minf(y + start_height, C.SHORE_Y)
+		y = minf(y + C.ZONE_HEIGHTS[i], C.SHORE_Y)
 		zone_y[i] = y
 	zone_y[0] = C.SHORE_Y
 
@@ -211,10 +289,10 @@ func on_respawn(s: Node2D) -> void:
 
 ## Серфер вернулся на лежак и сохранил временные очки.
 func on_saved(s: Node2D, amount: int) -> void:
-	_add_floater(Vector2(C.lane_x(s.lane), C.LOUNGER_Y - 60.0), "+%d" % amount, Color(0.4, 1.0, 0.4))
+	_add_floater(Vector2(C.lane_x(s.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "+%d" % amount, Color(0.4, 1.0, 0.4))
 
 
-# ---------------- Золотая зона x32 ----------------
+# ---------------- Золотая зона (всегда x256) ----------------
 
 ## Заранее выбираем 1–2 момента появления, разнося их по матчу.
 func _schedule_gold() -> void:
@@ -226,7 +304,7 @@ func _schedule_gold() -> void:
 
 
 func gold_height() -> float:
-	return (C.SHORE_Y - C.WALL_START_Y) * (C.ZONE_BOUNDS[C.ZONES] - C.ZONE_BOUNDS[C.ZONES - 1])  # как у x16
+	return C.GOLD_HEIGHT
 
 
 func gold_active() -> bool:
@@ -248,7 +326,140 @@ func _update_gold(delta: float) -> void:
 		gold_timer = C.GOLD_DURATION
 		var room := C.SHORE_Y - wall_y - gold_height()
 		gold_off = randf_range(0.0, maxf(room, 0.0))
-		_add_floater(Vector2(C.W * 0.5, wall_y + gold_off + gold_height() * 0.5), "ЗОЛОТАЯ ЗОНА x32!", C.GOLD_COLOR)
+		_add_floater(Vector2(C.W * 0.5, wall_y + gold_off + gold_height() * 0.5), "ЗОЛОТАЯ ЗОНА x%d!" % C.GOLD_POINTS, C.GOLD_COLOR)
+
+
+# ---------------- Торнадо ----------------
+
+## Центр красной полосы: граница зон x32 и x64 (нижний край x64).
+func tornado_y() -> float:
+	return minf(zone_y[6], C.SHORE_Y)
+
+
+## Полоса ещё в море (а не прижата валом к берегу).
+func tornado_band_alive() -> bool:
+	return tornado_y() < C.SHORE_Y - 30.0
+
+
+func tornado_speed() -> float:
+	return lerpf(C.TORNADO_SPEED[0], C.TORNADO_SPEED[1], clampf(round_time / C.ROUND_TIME, 0.0, 1.0))
+
+
+## Подходит ли торнадо к точке x в ближайшие ~0,9 с (для ботов: стоит ли сейчас лезть на полосу).
+func tornado_threat(x: float) -> bool:
+	var reach := C.TORNADO_RADIUS + 60.0
+	for t in tornadoes:
+		var ahead: float = (x - t["x"]) * t["dir"]  # >0 — точка впереди по ходу торнадо
+		if ahead > -reach and ahead < reach + tornado_speed() * (0.9 + t["warn"]):
+			return true
+	return false
+
+
+func _update_tornadoes(delta: float, progress: float) -> void:
+	var speed := tornado_speed()
+	# новое торнадо
+	tornado_timer -= delta
+	if tornado_timer <= 0.0 and tornado_band_alive():
+		tornado_timer = lerpf(C.TORNADO_INTERVAL[0], C.TORNADO_INTERVAL[1], progress) * randf_range(0.8, 1.2)
+		var dir := 1.0 if randf() < 0.5 else -1.0
+		var start_x := -C.TORNADO_RADIUS if dir > 0.0 else C.W + C.TORNADO_RADIUS
+		tornadoes.append({"x": start_x, "dir": dir, "warn": C.TORNADO_WARN})
+	# полёт и гибель тех, кого задело
+	var ty := tornado_y()
+	for t in tornadoes.duplicate():
+		if t["warn"] > 0.0:
+			t["warn"] -= delta
+			continue
+		t["x"] += t["dir"] * speed * delta
+		for s in surfers:
+			if s.in_water() and absf(s.position.y - ty) < C.TORNADO_BAND * 0.5 + 21.0 \
+					and absf(s.position.x - t["x"]) < C.TORNADO_RADIUS:
+				_eliminate(s, "Вжух!", "Тебя унесло торнадо!")
+		if t["x"] < -C.TORNADO_RADIUS * 2.0 or t["x"] > C.W + C.TORNADO_RADIUS * 2.0:
+			tornadoes.erase(t)
+
+
+# ---------------- Большая акула ----------------
+
+func _update_big_shark(delta: float) -> void:
+	if big_shark:
+		big_shark.tick(delta)
+		if big_shark.is_jumping():
+			for s in surfers:
+				if s.in_water() and big_shark.in_hit_zone(s.position):
+					_eliminate(s, "Ам!!!", "Тебя проглотила\nбольшая акула!")
+		if big_shark.is_gone() or zone_height(big_shark.zone) < C.ZONE_MIN_HEIGHT * 2.0:
+			big_shark.queue_free()
+			big_shark = null
+		return
+	big_shark_timer -= delta
+	if big_shark_timer > 0.0:
+		return
+	big_shark_timer = by_difficulty(C.BIG_SHARK_INTERVAL) * randf_range(0.8, 1.2)
+	# зона: над полосой торнадо — втрое чаще; сжатые валом зоны не берём
+	var weights := []
+	for i in C.ZONES:
+		weights.append(C.BIG_SHARK_ZONE_WEIGHTS[i] if zone_height(i) >= 200.0 else 0.0)
+	if weights.all(func(w): return w == 0.0):
+		return
+	big_shark = BigSharkScript.new()
+	add_child(big_shark)
+	big_shark.setup(self, _pick_weighted(weights), randf() < 0.5)
+
+## Для ботов: большая акула рядом (видна тень, скоро прыжок или прыгает).
+func big_shark_near(pos: Vector2, dist: float) -> bool:
+	return big_shark != null and big_shark.position.distance_to(pos) < dist
+
+
+# ---------------- Молния ----------------
+
+## Где может ударить молния: вода между валом и полосой торнадо (зоны x64, x128). Vector2(верх, низ).
+func lightning_area() -> Vector2:
+	return Vector2(wall_y + 40.0, tornado_y() - C.TORNADO_BAND * 0.5 - 20.0)
+
+
+func _update_lightning(delta: float) -> void:
+	# новый удар
+	lightning_timer -= delta
+	var area := lightning_area()
+	if lightning_timer <= 0.0 and tornado_band_alive() and area.y - area.x > 100.0:
+		lightning_timer = by_difficulty(C.LIGHTNING_INTERVAL) * randf_range(0.8, 1.2)
+		var target := Vector2(randf_range(60.0, C.W - 60.0), randf_range(area.x, area.y))
+		var victims := surfers.filter(func(s): return s.in_water() and s.position.y > area.x and s.position.y < area.y)
+		if not victims.is_empty() and randf() < C.LIGHTNING_AIM_CHANCE:
+			# целимся в серфера — туда, где он будет к удару, и с небольшой ошибкой
+			var v = victims.pick_random()
+			target = v.position + Vector2(0.0, v.velocity_y() * C.LIGHTNING_WARN)
+			target += Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)) * 50.0
+			target.y = clampf(target.y, area.x, area.y)
+		strikes.append({"target": target, "t": 0.0})
+	# удары
+	for st in strikes.duplicate():
+		st["t"] += delta
+		if st["t"] < C.LIGHTNING_WARN:
+			continue
+		strikes.erase(st)
+		var pos: Vector2 = st["target"]
+		for s in surfers:
+			if s.in_water() and s.position.distance_to(pos) < C.LIGHTNING_RADIUS:
+				_eliminate(s, "Бах!", "Тебя ударило\nмолнией!")
+		flashes.append({"target": pos, "life": 0.3})
+		for k in 20:  # искры
+			var vel := Vector2.from_angle(TAU * k / 20.0) * randf_range(150.0, 350.0)
+			sparks.append({"pos": pos, "vel": vel, "life": 0.5, "color": C.LIGHTNING_COLOR})
+	for f in flashes.duplicate():
+		f["life"] -= delta
+		if f["life"] <= 0.0:
+			flashes.erase(f)
+
+
+## Для ботов: скоро ли рядом ударит молния. Возвращает Y места удара или NAN, если опасности нет.
+func lightning_threat_y(pos: Vector2) -> float:
+	for st in strikes:
+		var target: Vector2 = st["target"]
+		if target.distance_to(pos) < C.LIGHTNING_RADIUS + 60.0:
+			return target.y
+	return NAN
 
 
 # ---------------- Бомба ----------------
@@ -287,9 +498,11 @@ func bomb_cost(s: Node2D) -> int:
 ## Мышь: бросок по клику. Палец: прижал — видишь круг, водишь — двигаешь, отпустил — бросок.
 func _aim_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
+		aim_screen = event.position
 		aim_pos = (make_input_local(event) as InputEventMouseMotion).position
 		aim_shown = true
 	elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
+		aim_screen = event.position
 		aim_pos = (make_input_local(event) as InputEventMouseButton).position
 		aim_shown = true
 		if event.pressed:
@@ -303,9 +516,10 @@ func _aim_input(event: InputEvent) -> void:
 				_add_floater(aim_pos, "Только в море!", Color(0.9, 0.9, 0.9))
 
 
-## Бомбу можно бросить только в море — между валом и линией прибоя.
+## Бомбу можно бросить только в море — между валом и линией прибоя
+## (и не туда, где море сейчас закрыто «прилипшим» к низу экрана пляжем).
 func _aim_ok(p: Vector2) -> bool:
-	return p.y > wall_y and p.y < C.SHORE_Y
+	return p.y > wall_y and p.y < C.SHORE_Y + beach_dy()
 
 
 ## Бросок бомбы любым серфером (игроком или ботом).
@@ -315,7 +529,7 @@ func _throw_bomb(thrower: Node2D, target: Vector2) -> void:
 	thrower.score -= cost
 	thrower.bomb_cd = C.BOMB_COOLDOWN
 	bombs.append({"target": target, "t": 0.0, "reward": cost * mult, "thrower": thrower})
-	_add_floater(Vector2(C.lane_x(thrower.lane), C.LOUNGER_Y - 60.0), "−%d" % cost, Color(1, 0.6, 0.3))
+	_add_floater(Vector2(C.lane_x(thrower.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "−%d" % cost, Color(1, 0.6, 0.3))
 
 
 ## Боты тоже бросают бомбы: с лежака или после гибели, в серферов в воде (и в игрока).
@@ -358,7 +572,7 @@ func _update_bombs(delta: float) -> void:
 		if hits > 0:
 			var reward: int = b["reward"] * hits
 			thrower.score += reward
-			_add_floater(Vector2(C.lane_x(thrower.lane), C.LOUNGER_Y - 60.0), "Попал! +%d" % reward, Color(0.4, 1.0, 0.4))
+			_add_floater(Vector2(C.lane_x(thrower.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "Попал! +%d" % reward, Color(0.4, 1.0, 0.4))
 		# на месте взрыва — ник того, кто бросил
 		_add_floater(pos + Vector2(0, -C.BOMB_RADIUS * 0.6), "Бомба: %s" % thrower.display_name, Color(1, 0.6, 0.2))
 		for k in 28:  # вспышка взрыва
@@ -366,14 +580,16 @@ func _update_bombs(delta: float) -> void:
 			sparks.append({"pos": pos, "vel": vel, "life": 0.6, "color": Color(1.0, randf_range(0.3, 0.7), 0.1)})
 
 
-## Множитель очков в точке: золотая зона перекрывает обычные.
+## Множитель очков в точке: зона x1…x128, а внутри золотой зоны — всегда x256.
 func points_mult_at(y: float) -> int:
+	var zone := zone_at(y)
+	if zone < 0:
+		return 0
 	if gold_active():
 		var span := gold_span()
 		if y >= span.x and y <= span.y:
 			return C.GOLD_POINTS
-	var zone := zone_at(y)
-	return 0 if zone < 0 else C.ZONE_POINTS[zone]
+	return C.ZONE_POINTS[zone]
 
 
 func zone_height(zone: int) -> float:
@@ -453,6 +669,8 @@ func wash_away(s: Node2D) -> void:
 
 
 func _eliminate(s: Node2D, floater_text: String, player_message: String) -> void:
+	if s.invuln > 0.0:
+		return  # бессмертие от кубка — никакие угрозы не страшны
 	death_marks.append({"lane": s.lane, "x": s.position.x, "off": s.position.y - wall_y})
 	var lost: float = s.die()
 	_add_floater(s.position, "%s −%d" % [floater_text, int(lost)], Color(1, 0.3, 0.3))
@@ -463,35 +681,130 @@ func _eliminate(s: Node2D, floater_text: String, player_message: String) -> void
 			_show_message("%s\nЖизни кончились" % player_message, 2.5)
 
 
-func _update_chest(delta: float) -> void:
-	if chest == null:
-		chest_timer -= delta
-		if chest_timer <= 0.0:
-			chest = ChestScript.new()
-			chest.position = Vector2(randf_range(90.0, C.W - 90.0), randf_range(wall_y + 120.0, C.SHORE_Y - 60.0))
-			add_child(chest)
+# ---------------- Ракеты ----------------
+
+## Кнопка «Ракета» видна, пока игрок на пляже или на лежаке.
+func _update_rocket_ui() -> void:
+	rockets_label.text = "Ракеты: %d/%d" % [player.rockets, C.ROCKET_MAX]
+	var on_land: bool = state == State.PLAYING and player.is_alive() and not player.in_water()
+	rocket_button.visible = on_land
+	if not on_land:
 		return
-	chest.tick(delta)
-	if chest.age >= C.CHEST_LIFE:
-		_remove_chest()
-	elif chest.age >= chest.bot_time:
-		var bots := surfers.filter(func(s): return s.is_bot and s.is_alive())
-		if bots.is_empty():
-			_remove_chest()
-		else:
-			_give_chest(bots.pick_random())
+	if player.rockets >= C.ROCKET_MAX:
+		rocket_button.text = "Ракет %d/%d" % [player.rockets, C.ROCKET_MAX]
+		rocket_button.disabled = true
+	else:
+		rocket_button.text = "Ракета −%d" % C.ROCKET_COST
+		rocket_button.disabled = player.score < C.ROCKET_COST
 
 
-func _give_chest(s: Node2D) -> void:
-	s.score += C.CHEST_POINTS
-	_add_floater(chest.position, "%s +%d" % [s.display_name, C.CHEST_POINTS], Color(1, 0.85, 0.2))
-	_remove_chest()
+func _on_buy_rocket() -> void:
+	if player.rockets >= C.ROCKET_MAX or player.score < C.ROCKET_COST:
+		return
+	player.score -= C.ROCKET_COST
+	player.rockets += 1
+	_add_floater(Vector2(C.lane_x(player.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "Ракета! −%d" % C.ROCKET_COST, Color(1, 0.6, 0.3))
 
 
-func _remove_chest() -> void:
-	chest.queue_free()
-	chest = null
-	chest_timer = randf_range(C.CHEST_INTERVAL[0], C.CHEST_INTERVAL[1])
+## Выстрел ракетой вбок (dir = −1 влево, +1 вправо) — только из воды.
+func _fire_rocket(s: Node2D, dir: float) -> void:
+	if not s.in_water():
+		return
+	if s.rockets <= 0:
+		_add_floater(s.position + Vector2(0, -60), "Нет ракет", Color(0.85, 0.85, 0.85))
+		return
+	s.rockets -= 1
+	rocket_shots.append({"pos": s.position + Vector2(dir * 45.0, 0.0), "dir": dir, "owner": s})
+
+
+## Полёт ракет: первая активная акула или соперник на пути — уничтожены, ракета тоже.
+func _update_rockets(delta: float) -> void:
+	for r in rocket_shots.duplicate():
+		r["pos"] += Vector2(r["dir"] * C.ROCKET_SPEED * delta, 0.0)
+		var pos: Vector2 = r["pos"]
+		var shooter: Node2D = r["owner"]
+		var hit := false
+		for sh in sharks.duplicate():
+			if sh.can_bite() and sh.position.distance_to(pos) < C.ROCKET_HIT + 20.0:
+				sharks.erase(sh)
+				sh.queue_free()
+				_add_floater(pos + Vector2(0, -50), "Акула сбита!", Color(1, 0.6, 0.3))
+				hit = true
+				break
+		if not hit and big_shark and big_shark.is_jumping() and big_shark.in_hit_zone(pos):
+			big_shark.queue_free()
+			big_shark = null
+			_add_floater(pos + Vector2(0, -80), "Большая акула сбита!", Color(1, 0.6, 0.3))
+			hit = true
+		if not hit:
+			for s in surfers:
+				if s != shooter and s.in_water() and s.position.distance_to(pos) < C.ROCKET_HIT:
+					_eliminate(s, "Ракета!", "Тебя сбил ракетой\n%s!" % shooter.display_name)
+					hit = true
+					break
+		if hit:
+			for k in 16:  # взрыв
+				var vel := Vector2.from_angle(TAU * k / 16.0) * randf_range(120.0, 260.0)
+				sparks.append({"pos": pos, "vel": vel, "life": 0.5, "color": Color(1.0, randf_range(0.4, 0.8), 0.2)})
+		if hit or pos.x < -100.0 or pos.x > C.W + 100.0:
+			rocket_shots.erase(r)
+
+
+# ---------------- Сундуки и кубки ----------------
+
+func _spawn_pickup(kind: String) -> void:
+	var pk := ChestScript.new()
+	pk.kind = kind
+	pk.position = Vector2(randf_range(90.0, C.W - 90.0), randf_range(wall_y + 120.0, C.SHORE_Y - 60.0))
+	add_child(pk)
+	pickups.append(pk)
+
+
+func _update_pickups(delta: float) -> void:
+	# сундуки — по таймеру, не дожидаясь, пока исчезнет прошлый
+	chest_timer -= delta
+	if chest_timer <= 0.0:
+		chest_timer = randf_range(C.CHEST_INTERVAL[0], C.CHEST_INTERVAL[1])
+		_spawn_pickup("chest")
+	# кубок — только когда прошлого уже нет
+	if not pickups.any(func(pk): return pk.kind == "trophy"):
+		trophy_timer -= delta
+		if trophy_timer <= 0.0:
+			_spawn_pickup("trophy")
+	for pk in pickups.duplicate():
+		pk.tick(delta)
+		if pk.age >= pk.life:
+			_remove_pickup(pk)
+		elif pk.age >= pk.bot_time:
+			var bots := surfers.filter(func(s): return s.is_bot and s.is_alive())
+			if bots.is_empty():
+				_remove_pickup(pk)
+			else:
+				_collect(pk, bots.pick_random())
+
+
+## Серфер забрал предмет: сундук — очки, кубок — бессмертие.
+func _collect(pk: Node2D, s: Node2D) -> void:
+	if pk.kind == "trophy":
+		s.invuln = C.TROPHY_INVULN
+		_add_floater(pk.position, "%s: бессмертие %d с!" % [s.display_name, int(C.TROPHY_INVULN)], Color(1, 0.9, 0.3))
+	else:
+		var reward := chest_reward()
+		s.score += reward
+		_add_floater(pk.position, "%s +%d" % [s.display_name, reward], Color(1, 0.85, 0.2))
+	_remove_pickup(pk)
+
+
+## Награда за сундук: очки/с в зоне x128 прямо сейчас × CHEST_REWARD_MULT.
+func chest_reward() -> int:
+	return int(C.ZONE_POINTS[C.ZONES - 1] * points_rate * C.CHEST_REWARD_MULT)
+
+
+func _remove_pickup(pk: Node2D) -> void:
+	if pk.kind == "trophy":
+		trophy_timer = randf_range(C.TROPHY_INTERVAL[0], C.TROPHY_INTERVAL[1])
+	pickups.erase(pk)
+	pk.queue_free()
 
 
 func _end_round() -> void:
@@ -595,20 +908,48 @@ func _pick_weighted(weights: Array) -> int:
 # ---------------- Рисование (заглушки вместо спрайтов) ----------------
 
 ## Режим «expand»: на длинном телефоне или широком экране видимая область больше 1080×1920.
-## Поле ставим по центру по горизонтали и прижимаем к низу (пляж всегда внизу),
+## Поле ставим по центру по горизонтали и прижимаем к низу (пляж внизу),
 ## а лишнее место сверху и по бокам занимают вал, вода и песок (рисуются с запасом EXTRA).
-const EXTRA := 2000.0
+const EXTRA := 3000.0
 
 
-func _fit_to_screen() -> void:
+## Камера: поле выше экрана, поэтому вид сдвигается вверх за игроком (cam_scroll — на сколько px).
+## Пока игрок на пляже, на лежаке или погиб — камера внизу, у пляжа.
+func _fit_to_screen(delta: float) -> void:
 	var vp := get_viewport().get_visible_rect().size
-	get_viewport().canvas_transform = Transform2D(0.0, Vector2((vp.x - C.W) * 0.5, vp.y - C.H))
+	var base_y := vp.y - C.H  # смещение, при котором низ поля совпадает с низом экрана
+	var max_scroll := maxf(-(wall_y - C.CAM_WALL_MARGIN) - base_y, 0.0)  # выше вала с запасом не поднимаемся
+	if aiming and aim_shown:
+		# прицел у края экрана — камера едет туда сама
+		var push := 0.0
+		if aim_screen.y < C.AIM_EDGE_TOP:
+			push = 1.0 - aim_screen.y / C.AIM_EDGE_TOP
+		elif aim_screen.y > vp.y - C.AIM_EDGE_BOTTOM:
+			push = -(aim_screen.y - (vp.y - C.AIM_EDGE_BOTTOM)) / C.AIM_EDGE_BOTTOM
+		cam_scroll = clampf(cam_scroll + clampf(push, -1.0, 1.0) * C.AIM_SCROLL_SPEED * delta, 0.0, max_scroll)
+	elif bombs.any(func(b): return b["thrower"] == player):
+		# бомба игрока ещё летит — камера ждёт на месте броска, чтобы был виден взрыв
+		cam_scroll = clampf(cam_scroll, 0.0, max_scroll)
+	else:
+		var target := 0.0
+		if state == State.PLAYING and player.in_water():
+			target = vp.y * C.CAM_PLAYER_AT - player.position.y - base_y
+		target = clampf(target, 0.0, max_scroll)
+		cam_scroll = lerpf(cam_scroll, target, 1.0 - exp(-C.CAM_SMOOTH * delta))
+	var offset := Vector2((vp.x - C.W) * 0.5, base_y + cam_scroll)
+	get_viewport().canvas_transform = Transform2D(0.0, offset)
+	view_top = -offset.y  # верх экрана в координатах поля
+	if aiming:
+		aim_pos = aim_screen - offset  # прицел остаётся под пальцем, а поле едет под ним
+
+
+## Пляж «прилипает» к низу экрана: когда камера поднята, полоса пляжа с лежаками
+## рисуется выше на cam_scroll и накрывает нижний край моря. Берег в игре при этом не двигается.
+func beach_dy() -> float:
+	return -cam_scroll
 
 
 func _draw() -> void:
-	# песок
-	draw_rect(Rect2(-EXTRA, C.SHORE_Y, C.W + EXTRA * 2.0, C.H - C.SHORE_Y + EXTRA), Color(0.95, 0.86, 0.65))
-
 	# зоны доходности
 	for i in C.ZONES:
 		var y_bottom: float = zone_y[i]
@@ -620,9 +961,10 @@ func _draw() -> void:
 		if y_bottom - y_top < 45.0:
 			continue  # зона сжалась валом — подпись не влезает
 		draw_circle(Vector2(45, mid), 33, Color(1, 1, 1, 0.25))
-		draw_string(font, Vector2(12, mid + 12), "x%d" % C.ZONE_POINTS[i], HORIZONTAL_ALIGNMENT_CENTER, 66, 33, Color.WHITE)
+		var label_size := 33 if C.ZONE_POINTS[i] < 100 else 26  # «x128» шире — шрифт поменьше
+		draw_string(font, Vector2(12, mid + 10), "x%d" % C.ZONE_POINTS[i], HORIZONTAL_ALIGNMENT_CENTER, 66, label_size, Color.WHITE)
 
-	# золотая зона x32 (мигает в последние 2 секунды)
+	# золотая зона x256 (мигает в последние 2 секунды)
 	if gold_active() and (gold_timer > 2.0 or int(gold_timer * 6.0) % 2 == 0):
 		var span := gold_span()
 		var shimmer := 0.5 + 0.1 * sin(time_passed * 6.0)
@@ -630,8 +972,16 @@ func _draw() -> void:
 		draw_rect(Rect2(0, span.x, C.W, span.y - span.x), Color(1, 0.95, 0.6), false, 4.5)
 		var gmid := (span.x + span.y) * 0.5
 		draw_circle(Vector2(45, gmid), 33, Color(0.55, 0.35, 0.0, 0.8))
-		draw_string(font, Vector2(12, gmid + 12), "x32", HORIZONTAL_ALIGNMENT_CENTER, 66, 30, Color.WHITE)
+		draw_string(font, Vector2(12, gmid + 10), "x%d" % C.GOLD_POINTS, HORIZONTAL_ALIGNMENT_CENTER, 66, 26, Color.WHITE)
 		draw_string(font, Vector2(C.W - 105, gmid + 15), "%d" % ceili(gold_timer), HORIZONTAL_ALIGNMENT_CENTER, 75, 42, Color.WHITE)
+
+	# красная полоса торнадо на границе x32 и x64
+	if tornado_band_alive():
+		var ty := tornado_y()
+		var band := Rect2(-EXTRA, ty - C.TORNADO_BAND * 0.5, C.W + EXTRA * 2.0, C.TORNADO_BAND)
+		draw_rect(band, Color(0.95, 0.1, 0.1, 0.35 + 0.1 * sin(time_passed * 4.0)))
+		draw_line(Vector2(-EXTRA, band.position.y), Vector2(C.W + EXTRA, band.position.y), Color(1, 0.35, 0.35, 0.9), 3.0)
+		draw_line(Vector2(-EXTRA, band.end.y), Vector2(C.W + EXTRA, band.end.y), Color(1, 0.35, 0.35, 0.9), 3.0)
 
 	# полоса игрока
 	draw_rect(Rect2(C.LANE_W * C.PLAYER_LANE, wall_y, C.LANE_W, C.SHORE_Y - wall_y), Color(1, 1, 1, 0.08))
@@ -639,14 +989,13 @@ func _draw() -> void:
 	# рябь на воде
 	var y := wall_y + 90.0
 	while y < C.SHORE_Y - 30.0:
-		_draw_wave_line(y, 6.0, Color(1, 1, 1, 0.18), 3.0, y * 0.067)
+		_draw_wave_line(self, y, 6.0, Color(1, 1, 1, 0.18), 3.0, y * 0.067)
 		y += 105.0
-	_draw_wave_line(C.SHORE_Y, 9.0, Color(1, 1, 1, 0.85), 6.0, 0.0)
 
 	# вал волн
 	draw_rect(Rect2(-EXTRA, -EXTRA, C.W + EXTRA * 2.0, wall_y + EXTRA), Color(0.87, 0.95, 0.98))
 	for k in 5:
-		_draw_wave_line(wall_y - k * 33.0, 15.0 + k * 3.0, Color(0.5, 0.71, 0.8), 4.5, k * 1.3)
+		_draw_wave_line(self, wall_y - k * 33.0, 15.0 + k * 3.0, Color(0.5, 0.71, 0.8), 4.5, k * 1.3)
 
 	# места гибели
 	for d in death_marks:
@@ -657,38 +1006,50 @@ func _draw() -> void:
 		draw_line(m + Vector2(-13.5, -13.5), m + Vector2(13.5, 13.5), Color.WHITE, 6.0)
 		draw_line(m + Vector2(-13.5, 13.5), m + Vector2(13.5, -13.5), Color.WHITE, 6.0)
 
+
+## Пляж с лежаками — отдельный слой поверх моря, акул и плывущих серферов.
+## Сдвинут на beach_dy(), чтобы всегда оставаться внизу экрана.
+func _draw_beach() -> void:
+	var b := beach_layer
+	var dy := beach_dy()
+	var shore := C.SHORE_Y + dy
+	var ly := C.LOUNGER_Y + dy
+	# песок и линия прибоя
+	b.draw_rect(Rect2(-EXTRA, shore, C.W + EXTRA * 2.0, C.H - C.SHORE_Y + EXTRA), Color(0.95, 0.86, 0.65))
+	_draw_wave_line(b, shore, 9.0, Color(1, 1, 1, 0.85), 6.0, 0.0)
+
 	# лежаки со счётом
 	for s in surfers:
 		var cx := C.lane_x(s.lane)
-		var r := Rect2(cx - 78, C.LOUNGER_Y + 15, 156, 105)
-		draw_rect(r, Color(0.9, 0.62, 0.23) if s == player else Color(0.79, 0.42, 0.23))
-		draw_rect(r, Color(0, 0, 0, 0.5), false, 4.5)
-		draw_string(font, Vector2(cx - 78, C.LOUNGER_Y + 78), str(int(s.score)), HORIZONTAL_ALIGNMENT_CENTER, 156, 45, Color.WHITE)
-		draw_string(font, Vector2(cx - 78, C.LOUNGER_Y + 111), s.display_name, HORIZONTAL_ALIGNMENT_CENTER, 156, 24, Color(0.15, 0.1, 0.05))
+		var r := Rect2(cx - 78, ly + 15, 156, 105)
+		b.draw_rect(r, Color(0.9, 0.62, 0.23) if s == player else Color(0.79, 0.42, 0.23))
+		b.draw_rect(r, Color(0, 0, 0, 0.5), false, 4.5)
+		b.draw_string(font, Vector2(cx - 78, ly + 78), str(int(s.score)), HORIZONTAL_ALIGNMENT_CENTER, 156, 45, Color.WHITE)
+		b.draw_string(font, Vector2(cx - 78, ly + 111), s.display_name, HORIZONTAL_ALIGNMENT_CENTER, 156, 24, Color(0.15, 0.1, 0.05))
 		# временные очки: набраны в воде, но ещё не сохранены на лежаке
 		if s.unsaved >= 1.0:
-			var tag := Rect2(cx - 60, C.LOUNGER_Y - 39, 120, 51)
-			draw_rect(tag, Color(0, 0, 0, 0.55))
-			draw_string(font, Vector2(cx - 60, C.LOUNGER_Y), "+%d" % int(s.unsaved), HORIZONTAL_ALIGNMENT_CENTER, 120, 39, Color(1, 0.95, 0.3))
+			var tag := Rect2(cx - 60, ly - 39, 120, 51)
+			b.draw_rect(tag, Color(0, 0, 0, 0.55))
+			b.draw_string(font, Vector2(cx - 60, ly), "+%d" % int(s.unsaved), HORIZONTAL_ALIGNMENT_CENTER, 120, 39, Color(1, 0.95, 0.3))
 		# жизни: красные точки — оставшиеся, серые — потерянные
 		for i in C.LIVES:
 			var dot_col := Color(0.9, 0.15, 0.15) if i < s.lives else Color(0.3, 0.3, 0.3, 0.6)
-			draw_circle(Vector2(cx - 63 + i * 21, C.LOUNGER_Y + 30), 7.5, dot_col)
+			b.draw_circle(Vector2(cx - 63 + i * 21, ly + 30), 7.5, dot_col)
 		if s.respawn_timer > 0.0:
 			# отсчёт до возвращения на лежак
-			draw_circle(Vector2(cx, C.LOUNGER_Y - 12), 33, Color(0, 0, 0, 0.6))
-			draw_string(font, Vector2(cx - 33, C.LOUNGER_Y + 3), str(ceili(s.respawn_timer)), HORIZONTAL_ALIGNMENT_CENTER, 66, 42, Color.WHITE)
+			b.draw_circle(Vector2(cx, ly - 12), 33, Color(0, 0, 0, 0.6))
+			b.draw_string(font, Vector2(cx - 33, ly + 3), str(ceili(s.respawn_timer)), HORIZONTAL_ALIGNMENT_CENTER, 66, 42, Color.WHITE)
 		elif s.is_out():
-			draw_rect(r, Color(0, 0, 0, 0.45))  # выбыл — лежак затемнён
+			b.draw_rect(r, Color(0, 0, 0, 0.45))  # выбыл — лежак затемнён
 
 
-func _draw_wave_line(y: float, amp: float, col: Color, width: float, phase: float) -> void:
+func _draw_wave_line(ci: CanvasItem, y: float, amp: float, col: Color, width: float, phase: float) -> void:
 	var pts := PackedVector2Array()
 	var x := -EXTRA
 	while x <= C.W + EXTRA:
 		pts.append(Vector2(x, y + sin(x * 0.02 + time_passed * 2.0 + phase) * amp))
 		x += 18.0
-	draw_polyline(pts, col, width, true)
+	ci.draw_polyline(pts, col, width, true)
 
 
 ## Летящие бомбы: тонкий круг — зона взрыва, а толстое кольцо сжимается к центру —
@@ -710,8 +1071,8 @@ func _draw_bombs() -> void:
 
 ## Подсказка в режиме прицеливания: пляж затемнён, сверху надпись.
 func _draw_aiming() -> void:
-	overlay.draw_rect(Rect2(0, C.SHORE_Y, C.W, C.LOUNGER_Y - C.SHORE_Y - 45.0), Color(0, 0, 0, 0.25))
-	var y := wall_y + 45.0
+	overlay.draw_rect(Rect2(0, C.SHORE_Y + beach_dy(), C.W, C.LOUNGER_Y - C.SHORE_Y - 45.0), Color(0, 0, 0, 0.25))
+	var y := maxf(wall_y, view_top + 160.0) + 45.0  # под верхней панелью, даже если вал выше экрана
 	overlay.draw_rect(Rect2(165, y - 42, 750, 60), Color(0, 0, 0, 0.55))
 	overlay.draw_string(font, Vector2(165, y), "Наведи и отпусти — туда упадёт бомба", HORIZONTAL_ALIGNMENT_CENTER, 750, 36, Color(1, 0.85, 0.4))
 	if not aim_shown:
@@ -728,7 +1089,71 @@ func _draw_aiming() -> void:
 		overlay.draw_line(aim_pos + Vector2(-21, 21), aim_pos + Vector2(21, -21), Color(0.9, 0.2, 0.2), 6.0)
 
 
+## Торнадо: перед вылетом у края полосы мигает красная стрелка, потом летит воронка
+## (стопка вращающихся колец, сужающихся книзу).
+func _draw_tornadoes() -> void:
+	var ty := tornado_y()
+	for t in tornadoes:
+		var dir: float = t["dir"]
+		if t["warn"] > 0.0:
+			if int(t["warn"] * 10.0) % 2 == 0:
+				var edge := 30.0 if dir > 0.0 else C.W - 30.0
+				var tip := Vector2(edge + dir * 40.0, ty)
+				overlay.draw_colored_polygon(PackedVector2Array([
+					tip, Vector2(edge - dir * 10.0, ty - 30.0), Vector2(edge - dir * 10.0, ty + 30.0)]), Color(1, 0.15, 0.1, 0.95))
+			continue
+		var base := Vector2(t["x"], ty + C.TORNADO_BAND * 0.5)
+		for i in 7:
+			var k := i / 6.0
+			var r := lerpf(12.0, C.TORNADO_RADIUS + 9.0, k)
+			var c := base + Vector2(sin(time_passed * 9.0 + i) * 9.0 * k, -i * 18.0)
+			overlay.draw_arc(c, r, time_passed * 8.0 + i, time_passed * 8.0 + i + PI * 1.5, 16, Color(0.85, 0.85, 0.9, 0.9 - k * 0.3), 6.0)
+			overlay.draw_arc(c, r * 0.6, -time_passed * 6.0, -time_passed * 6.0 + PI, 12, Color(0.6, 0.6, 0.7, 0.85), 4.5)
+
+
+## Молния: светящийся круг с кольцом, сжимающимся к центру, а в момент удара —
+## ломаная молния с неба и вспышка.
+func _draw_lightning() -> void:
+	var col := C.LIGHTNING_COLOR
+	for st in strikes:
+		var target: Vector2 = st["target"]
+		var k: float = st["t"] / C.LIGHTNING_WARN
+		overlay.draw_circle(target, C.LIGHTNING_RADIUS, Color(col, 0.12 + 0.08 * sin(time_passed * 20.0)))
+		overlay.draw_arc(target, C.LIGHTNING_RADIUS, 0, TAU, 40, Color(col, 0.8), 3.0)
+		var ring := lerpf(C.LIGHTNING_RADIUS * 1.8, 0.0, k)
+		if ring > 3.0:
+			overlay.draw_arc(target, ring, 0, TAU, 40, Color(1, 1, 0.7, 0.6 + 0.4 * k), 6.0)
+	for f in flashes:
+		var target: Vector2 = f["target"]
+		var a: float = f["life"] / 0.3
+		# ломаная от верха экрана до места удара
+		var pts := PackedVector2Array()
+		var top := view_top - 50.0
+		var steps := 9
+		for i in steps + 1:
+			var y := lerpf(top, target.y, float(i) / steps)
+			var jitter := 0.0 if i == 0 or i == steps else randf_range(-45.0, 45.0)
+			pts.append(Vector2(target.x + jitter, y))
+		overlay.draw_polyline(pts, Color(1, 1, 0.85, a), 12.0)
+		overlay.draw_polyline(pts, Color(1, 1, 1, a), 4.0)
+		overlay.draw_circle(target, C.LIGHTNING_RADIUS * (1.2 - a * 0.4), Color(1, 1, 0.8, a * 0.6))
+
+
+## Ракеты: корпус с носом и огнём из сопла.
+func _draw_rockets() -> void:
+	for r in rocket_shots:
+		var p: Vector2 = r["pos"]
+		var d: float = r["dir"]
+		overlay.draw_rect(Rect2(p.x - 22.0, p.y - 8.0, 44.0, 16.0), Color(0.85, 0.85, 0.9))
+		overlay.draw_colored_polygon(PackedVector2Array([Vector2(p.x + d * 22.0, p.y - 8.0), Vector2(p.x + d * 40.0, p.y), Vector2(p.x + d * 22.0, p.y + 8.0)]), Color(0.9, 0.2, 0.15))
+		var flame := 18.0 + randf() * 14.0
+		overlay.draw_colored_polygon(PackedVector2Array([Vector2(p.x - d * 22.0, p.y - 7.0), Vector2(p.x - d * (22.0 + flame), p.y), Vector2(p.x - d * 22.0, p.y + 7.0)]), Color(1, 0.6, 0.1, 0.9))
+
+
 func _draw_overlay() -> void:
+	_draw_tornadoes()
+	_draw_rockets()
+	_draw_lightning()
 	_draw_bombs()
 	if aiming:
 		_draw_aiming()
