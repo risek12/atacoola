@@ -2,6 +2,7 @@ extends Node2D
 ## Большая акула (ивент): в 3 раза больше обычной. Плывёт тенью под водой, а потом
 ## выпрыгивает с открытой пастью и кусает всех в овальной зоне. Перед прыжком тень темнеет
 ## и показывает красную зону укуса — успей уплыть.
+## Поле кольцевое: появляется тенью в случайном месте, проплывает круг и уходит на глубину.
 
 const C = preload("res://scripts/cfg.gd")
 
@@ -14,6 +15,9 @@ var dir := 1.0
 var vis: int = V.SHADOW
 var vis_timer := 3.0
 var age := 0.0
+var travelled := 0.0
+var fade := 0.0  # 0…1: проявление тени при появлении и исчезновение при уходе
+var leaving := false
 
 
 func setup(g: Node2D, z: int, from_left: bool) -> void:
@@ -21,7 +25,7 @@ func setup(g: Node2D, z: int, from_left: bool) -> void:
 	zone = z
 	zone_u = randf_range(0.3, 0.7)
 	dir = 1.0 if from_left else -1.0
-	position.x = -300.0 if from_left else C.W + 300.0
+	position.x = randf_range(0.0, C.W)
 	vis_timer = _shadow_time()
 	z_index = 1
 	scale = Vector2.ONE * C.ART_SCALE * C.BIG_SHARK_SCALE  # фигура задана как у обычной акулы для поля 720×1280
@@ -37,13 +41,18 @@ func _shadow_time() -> float:
 func tick(delta: float) -> void:
 	age += delta
 	if vis == V.SHADOW:
-		position.x += dir * C.BIG_SHARK_SPEED * delta  # во время прыжка зависает на месте
+		position.x = C.wrap_x(position.x + dir * C.BIG_SHARK_SPEED * delta)  # во время прыжка зависает на месте
+		travelled += C.BIG_SHARK_SPEED * delta
 	var base_y: float = lerpf(game.zone_y[zone], game.zone_y[zone + 1], zone_u)
 	position.y = clampf(base_y, game.wall_y + 60.0, C.SHORE_Y - 60.0)
+	# проплыла круг — уходит на глубину (но не посреди предупреждения о прыжке)
+	if travelled >= C.W and vis == V.SHADOW and not is_warning():
+		leaving = true
+	fade = clampf(fade + (-delta if leaving else delta) / 0.8, 0.0, 1.0)
+	if leaving:
+		queue_redraw()
+		return
 	vis_timer -= delta
-	# не прыгаем (и не начинаем предупреждать), пока не заплыли на экран — иначе нечестно
-	if vis == V.SHADOW and (position.x < 150.0 or position.x > C.W - 150.0):
-		vis_timer = maxf(vis_timer, C.BIG_SHARK_WARN + 0.3)
 	if vis_timer <= 0.0:
 		if vis == V.SHADOW:
 			vis = V.JUMP
@@ -61,17 +70,17 @@ func is_jumping() -> bool:
 
 ## Скоро прыжок — тень темнеет (для отрисовки и для ботов).
 func is_warning() -> bool:
-	return vis == V.SHADOW and vis_timer < C.BIG_SHARK_WARN
+	return vis == V.SHADOW and vis_timer < C.BIG_SHARK_WARN and not leaving
 
 
 ## Попал ли серфер в овальную зону укуса.
 func in_hit_zone(p: Vector2) -> bool:
-	var d := p - position
+	var d := Vector2(C.wrap_dx(p.x, position.x), p.y - position.y)  # через шов тоже достаёт
 	return pow(d.x / C.BIG_SHARK_HIT_RX, 2.0) + pow(d.y / C.BIG_SHARK_HIT_RY, 2.0) < 1.0
 
 
 func is_gone() -> bool:
-	return (dir > 0.0 and position.x > C.W + 350.0) or (dir < 0.0 and position.x < -350.0)
+	return leaving and fade <= 0.0
 
 
 func _ellipse(rx: float, ry: float, col: Color) -> void:
@@ -92,14 +101,21 @@ func _hit_outline(col: Color, width: float) -> void:
 	draw_polyline(pts, col, width)
 
 
+## У шва рисуем акулу дважды — с обеих сторон поля.
 func _draw() -> void:
+	for ox in C.ring_copies(position.x, C.BIG_SHARK_HIT_RX + 60.0):
+		_draw_body(Vector2(ox / scale.x, 0.0))
+
+
+func _draw_body(shift: Vector2) -> void:
+	draw_set_transform(shift)
 	if vis == V.SHADOW:
 		var warn := is_warning()
-		var alpha := 0.35
+		var alpha := 0.35 * fade
 		if warn:
 			alpha = 0.45 + 0.2 * sin(age * 20.0)  # пульсирует перед прыжком
 			_hit_outline(Color(1, 0.15, 0.1, 0.8), 1.0)
-		draw_set_transform(Vector2.ZERO, 0.0, Vector2(dir, 1.0))
+		draw_set_transform(shift, 0.0, Vector2(dir, 1.0))
 		_ellipse(40, 14, Color(0.02, 0.08, 0.18, alpha))
 		draw_colored_polygon(PackedVector2Array([Vector2(-34, 0), Vector2(-52, -14), Vector2(-48, 0), Vector2(-52, 14)]), Color(0.02, 0.08, 0.18, alpha))
 		return
@@ -108,7 +124,7 @@ func _draw() -> void:
 	var k := 1.0 - absf(vis_timer / C.BIG_SHARK_JUMP_TIME * 2.0 - 1.0)  # 0 → 1 (вершина) → 0
 	_hit_outline(Color(1, 0.1, 0.1, 0.9), 1.0)
 	draw_arc(Vector2.ZERO, 30 + 10 * k, 0, TAU, 32, Color(1, 1, 1, 0.8), 1.2)
-	draw_set_transform(Vector2(0, -6 * k), 0.0, Vector2(dir, 1.0) * (1.0 + 0.15 * k))
+	draw_set_transform(shift + Vector2(0, -6 * k), 0.0, Vector2(dir, 1.0) * (1.0 + 0.15 * k))
 	draw_colored_polygon(PackedVector2Array([Vector2(-32, 0), Vector2(-54, -18), Vector2(-48, 0), Vector2(-54, 18)]), Color(0.38, 0.43, 0.48))
 	_ellipse(40, 15, Color(0.45, 0.5, 0.56))
 	draw_colored_polygon(PackedVector2Array([Vector2(-6, -10), Vector2(4, -28), Vector2(12, -10)]), Color(0.36, 0.41, 0.46))

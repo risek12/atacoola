@@ -15,8 +15,8 @@ var holding := false
 var returning := false  # уже побывал в воде: на пляже сносит обратно к лежаку
 var touching_wall := false
 var wall_touch_time := 0.0  # сколько секунд за раунд серфер касался вала (в сумме)
-var score := 0.0    # сохранённые очки (на лежаке)
-var unsaved := 0.0  # временные очки, набранные в воде: сохраняются на лежаке, при гибели — только 30%
+var score := 0.0    # очки за раунд: набранное в воде сразу идёт в счёт
+var streak_t := 0.0  # сколько секунд серфер плавает без гибели (для множителя серии)
 var lives := C.LIVES
 var respawn_timer := 0.0  # > 0 — серфер погиб и скоро вернётся на лежак
 var bomb_cd := 0.0        # перезарядка бомбы, сек
@@ -26,6 +26,7 @@ var back_holding := false # палец на пляже (нижней полос�
 var accel_t := 0.0        # сколько секунд палец держат подряд (для разгона до ×1,7)
 var dash_v := 0.0         # скорость рывка (гаснет), px/с: минус — вперёд, плюс — назад
 var dash_cd := 0.0        # перезарядка рывка
+var dash_t := 0.0         # > 0 — идёт рывок, серфер бессмертен
 var last_vy := 0.0        # текущая вертикальная скорость в воде (для упреждения ботов)
 
 # Поведение бота
@@ -34,7 +35,7 @@ var bot_rest := 0.0
 var bot_target_off := 97.0  # запасная цель: на сколько пикселей ниже вала держится бот
 var bot_target_zone := 4    # в какую зону плывёт бот (3 = x8 … 7 = x128)
 var bot_trip_time := 0.0    # сколько секунд бот уже в воде в этом заплыве
-var bot_trip_len := 15.0    # пробыв в воде столько секунд, бот плывёт сохраняться на лежак
+var bot_trip_len := 15.0    # пробыв в воде столько секунд, бот выбирает новую цель
 var bot_flee := 0.0
 var bot_tornado_wait := 0.0  # > 0 — бот пережидает торнадо у полосы
 var bot_big_flee := 0.0      # > 0 — бот уплывает от большой акулы
@@ -89,6 +90,18 @@ func dash(dir: float) -> void:
 		return
 	dash_v = dir * C.DASH_SPEED
 	dash_cd = C.DASH_COOLDOWN
+	dash_t = C.DASH_INVULN_TIME
+	game.on_dash(self)
+
+
+## Множитель серии: растёт ступеньками, пока серфер плавает без гибели.
+func streak_mult() -> float:
+	return minf(1.0 + floorf(streak_t / C.STREAK_STEP_TIME) * C.STREAK_STEP_BONUS, C.STREAK_MAX)
+
+
+## Бессмертен: кубок или идёт рывок.
+func is_invulnerable() -> bool:
+	return invuln > 0.0 or dash_t > 0.0
 
 
 func is_alive() -> bool:
@@ -115,12 +128,11 @@ func velocity_y() -> float:
 	return last_vy
 
 
-## Гибель в воде: DEATH_PENALTY (70%) временных очков сгорает, остальное идёт в счёт.
-## Возвращает, сколько очков потеряно.
+## Гибель в воде: теряется жизнь и DEATH_SCORE_PENALTY счёта. Возвращает, сколько очков потеряно.
 func die() -> float:
-	var lost := unsaved * C.DEATH_PENALTY
-	score += unsaved - lost
-	unsaved = 0.0
+	var lost := score * C.DEATH_SCORE_PENALTY
+	score -= lost
+	streak_t = 0.0
 	state = S.DEAD
 	holding = false
 	back_holding = false
@@ -153,13 +165,10 @@ func _respawn() -> void:
 func _reset_swim() -> void:
 	accel_t = 0.0
 	dash_v = 0.0
+	dash_t = 0.0
 
 
-## Конец раунда: выжившие сохраняют все временные очки.
 func finish() -> void:
-	if state != S.DEAD:
-		score += unsaved
-		unsaved = 0.0
 	holding = false
 
 
@@ -171,6 +180,7 @@ func tick(delta: float) -> void:
 				_respawn()
 		return
 	dash_cd = maxf(dash_cd - delta, 0.0)
+	dash_t = maxf(dash_t - delta, 0.0)
 	invuln = maxf(invuln - delta, 0.0)
 	if is_bot:
 		_bot_think(delta)
@@ -213,7 +223,7 @@ func tick(delta: float) -> void:
 				_reset_swim()
 
 	# Касание вала: мигаем красным, а за WALL_TOUCH_LIMIT секунд в сумме — проигрыш
-	touching_wall = state == S.WATER and position.y <= game.wall_y + C.WALL_GAP + 1.5 and invuln <= 0.0
+	touching_wall = state == S.WATER and position.y <= game.wall_y + C.WALL_GAP + 1.5 and not is_invulnerable()
 	if touching_wall:
 		wall_touch_time += delta
 		modulate = Color(1, 0.25, 0.25) if int(wall_touch_time * 10.0) % 2 == 0 else Color.WHITE
@@ -226,7 +236,11 @@ func tick(delta: float) -> void:
 
 	if state == S.WATER:
 		var mult: int = game.points_mult_at(position.y)  # зона x1…x128, в золотой зоне — x256
-		unsaved += mult * game.points_rate * delta
+		var old_streak := streak_mult()
+		streak_t += delta
+		if streak_mult() > old_streak:
+			game.on_streak_up(self)
+		score += mult * game.points_rate * streak_mult() * delta
 	queue_redraw()
 
 
@@ -234,10 +248,6 @@ func _arrive_lounger() -> void:
 	position.y = C.LOUNGER_Y
 	state = S.LOUNGER
 	returning = false
-	if unsaved >= 1.0:
-		game.on_saved(self, int(unsaved))
-	score += unsaved
-	unsaved = 0.0
 	bot_going_out = false
 	bot_rest = randf_range(0.3, 1.0)
 
@@ -304,7 +314,7 @@ func _bot_think(delta: float) -> void:
 				holding = position.y > target_y
 				bot_trip_time += delta
 				if bot_trip_time >= bot_trip_len:
-					bot_going_out = false  # нагулялся — плывёт сохраняться
+					_plan_trip()  # сохраняться не нужно — просто меняет зону
 			# большая акула рядом: уплываем от неё по вертикали (выше неё — к валу, ниже — к берегу)
 			if bot_big_flee > 0.0:
 				bot_big_flee -= delta
@@ -332,6 +342,8 @@ func _draw() -> void:
 		# доска
 		draw_rect(Rect2(-10, -28, 20, 56), Color(1.0, 0.95, 0.75))
 		draw_rect(Rect2(-10, -28, 20, 56), Color(0, 0, 0, 0.4), false, 2.0)
+		if dash_t > 0.0 or absf(dash_v) > 200.0:
+			_draw_dash_trail()
 		if holding:
 			# след от гребка
 			draw_line(Vector2(-12, 30), Vector2(-22, 48), Color.WHITE, 3.0)
@@ -344,8 +356,72 @@ func _draw() -> void:
 		# бессмертие от кубка: золотое сияние (мигает в последнюю секунду)
 		draw_circle(Vector2.ZERO, 34, Color(1, 0.85, 0.2, 0.25))
 		draw_arc(Vector2.ZERO, 36, 0, TAU, 32, Color(1, 0.85, 0.2, 0.9), 3.0)
+	if dash_t > 0.0:
+		# рывок: голубой щит — сейчас ничто не страшно
+		draw_circle(Vector2.ZERO, 34, Color(0.5, 0.9, 1.0, 0.25))
+		draw_arc(Vector2.ZERO, 36, 0, TAU, 32, Color(0.6, 0.95, 1.0, 0.95), 3.0)
+	if not is_bot and state == S.WATER:
+		_draw_dash_meter()
+	if state == S.WATER and streak_mult() > 1.0:
+		_draw_streak()
+	if state == S.WATER and rockets > 0:
+		_draw_rocket_icons()
 	if wall_touch_time > 0.0:
 		# полоска «запаса» касания вала
 		var left := 1.0 - wall_touch_time / C.WALL_TOUCH_LIMIT
 		draw_rect(Rect2(-25, 34, 50, 6), Color(0, 0, 0, 0.5))
 		draw_rect(Rect2(-25, 34, 50 * left, 6), Color(1, 0.3, 0.3))
+
+
+## Анимация рывка: полупрозрачные «призраки» позади и линии скорости по бокам.
+func _draw_dash_trail() -> void:
+	var back := -signf(dash_v)  # позади — против направления рывка
+	var power := clampf(absf(dash_v) / C.DASH_SPEED, 0.0, 1.0)
+	for i in range(3, 0, -1):
+		var off := Vector2(0, back * i * 22.0 * power)
+		var a := 0.35 * power * (1.0 - i / 4.0)
+		draw_rect(Rect2(off.x - 10, off.y - 28, 20, 56), Color(0.7, 0.95, 1.0, a))
+		draw_circle(off + Vector2(0, 2), 14, Color(color, a))
+	for side in [-1.0, 1.0]:
+		for j in 2:
+			var x: float = side * (24.0 + j * 9.0)
+			var y0 := back * (10.0 + j * 14.0)
+			draw_line(Vector2(x, y0), Vector2(x, y0 + back * 40.0 * power), Color(1, 1, 1, 0.8 * power), 3.0)
+
+
+## Шкала рывка: дуга у игрока копится по часовой; полная — рывок готов (мягко пульсирует).
+func _draw_dash_meter() -> void:
+	var k := 1.0 - dash_cd / C.DASH_COOLDOWN
+	var r := 44.0
+	var start := -PI * 0.5
+	draw_arc(Vector2.ZERO, r, 0, TAU, 40, Color(0, 0, 0, 0.35), 5.0)
+	if k >= 1.0:
+		var pulse := 0.75 + 0.25 * sin(Time.get_ticks_msec() * 0.008)
+		draw_arc(Vector2.ZERO, r, 0, TAU, 40, Color(0.4, 0.9, 1.0, pulse), 5.0)
+	elif k > 0.0:
+		draw_arc(Vector2.ZERO, r, start, start + TAU * k, 40, Color(0.4, 0.75, 1.0, 0.8), 5.0)
+
+
+## Множитель серии над головой: чем выше, тем ярче и крупнее — видно и соперникам.
+func _draw_streak() -> void:
+	var k := (streak_mult() - 1.0) / (C.STREAK_MAX - 1.0)
+	var col := Color(1.0, lerpf(0.95, 0.45, k), lerpf(0.4, 0.1, k))
+	var size := int(lerpf(18.0, 24.0, k))
+	var text := "×%s" % String.num(streak_mult(), 2)
+	draw_string_outline(_font, Vector2(-40, -52), text, HORIZONTAL_ALIGNMENT_CENTER, 80, size, 4, Color(0, 0, 0, 0.8))
+	draw_string(_font, Vector2(-40, -52), text, HORIZONTAL_ALIGNMENT_CENTER, 80, size, col)
+
+
+## Сколько ракет у серфера: маленькие ракеты под ним — соперники видят, кто может выстрелить.
+func _draw_rocket_icons() -> void:
+	var w := 16.0
+	var gap := 4.0
+	var x0 := -(rockets * w + (rockets - 1) * gap) * 0.5
+	var y := 54.0
+	for i in rockets:
+		var x := x0 + i * (w + gap)
+		draw_rect(Rect2(x - 1, y - 4, w - 2, 8), Color(0, 0, 0, 0.6))
+		draw_rect(Rect2(x, y - 3, w - 6, 6), Color(0.9, 0.9, 0.95))
+		draw_colored_polygon(PackedVector2Array([Vector2(x + w - 6, y - 3), Vector2(x + w, y), Vector2(x + w - 6, y + 3)]), Color(0.95, 0.25, 0.15))
+		draw_colored_polygon(PackedVector2Array([Vector2(x, y - 2), Vector2(x - 4, y), Vector2(x, y + 2)]), Color(1, 0.6, 0.1))
+

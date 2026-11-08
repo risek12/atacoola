@@ -1,6 +1,8 @@
 extends Node2D
 ## Акула. Плывёт поперёк полос и по кругу меняет состояние видимости:
 ## тень -> пузыри -> плавник -> полная видимость (кусает!) -> снова тень.
+## Поле кольцевое: акула появляется тенью в случайном месте, проплывает круг
+## (уйдя за край, выплывает с другой стороны) и уходит на глубину.
 
 const C = preload("res://scripts/cfg.gd")
 
@@ -26,6 +28,9 @@ var tilt := 0.0     # наклон корпуса по направлению д
 var vis: int = V.SHADOW
 var vis_timer := 2.0
 var age := 0.0
+var travelled := 0.0  # сколько проплыла по горизонтали; после круга уходит на глубину
+var fade := 0.0       # 0…1: проявление тени при появлении и исчезновение при уходе
+var leaving := false
 
 
 func setup(g: Node2D, z: int, u: float, from_left: bool) -> void:
@@ -35,7 +40,7 @@ func setup(g: Node2D, z: int, u: float, from_left: bool) -> void:
 	dir = 1.0 if from_left else -1.0
 	face = dir
 	speed = _pick_type_speed() * randf_range(1.0 - C.SHARK_SPEED_SPREAD, 1.0 + C.SHARK_SPEED_SPREAD)
-	base_x = -90.0 if from_left else C.W + 90.0
+	base_x = randf_range(0.0, C.W)
 	pattern = _pick_pattern()
 	age = randf_range(0.0, 10.0)  # разная начальная фаза, чтобы акулы не двигались синхронно
 	match pattern:
@@ -57,7 +62,7 @@ func setup(g: Node2D, z: int, u: float, from_left: bool) -> void:
 			amp = randf_range(7.5, 22.5)
 			freq = randf_range(1.0, 1.8)
 	vis = V.SHADOW
-	vis_timer = randf_range(0.3, 1.5)  # выплывает в тени и вскоре начинает всплывать
+	vis_timer = randf_range(1.0, 2.0)  # появляется тенью и вскоре начинает всплывать
 	z_index = 1
 	scale = Vector2(C.ART_SCALE, C.ART_SCALE)  # фигура акулы задана для поля 720×1280
 	tick(0.0)
@@ -115,18 +120,28 @@ func tick(delta: float) -> void:
 		P.DASH:
 			cur_speed = speed * (0.4 + 1.2 * pow(maxf(0.0, sin(age * freq)), 2.0))
 			off.y = sin(age * 3.0) * amp
-	base_x += dir * cur_speed * delta
+	base_x = C.wrap_x(base_x + dir * cur_speed * delta)
+	travelled += cur_speed * delta
 	var base_y: float = lerpf(game.zone_y[zone], game.zone_y[zone + 1], zone_u)
-	position.x = base_x + off.x
+	position.x = C.wrap_x(base_x + off.x)
 	position.y = clampf(base_y + off.y, game.wall_y + 30.0, C.SHORE_Y - 30.0)
 
 	# Поворачиваем акулу по направлению движения (но не строго вверх/вниз)
 	var vel := position - old_pos
+	vel.x = C.wrap_dx(position.x, old_pos.x)  # переход через шов — не скачок
 	if delta > 0.0 and vel.length() > 0.01:
 		if absf(vel.x) > 0.3:
 			face = signf(vel.x)
 		var target_tilt := clampf(atan2(vel.y, absf(vel.x)), -0.7, 0.7)
 		tilt = lerpf(tilt, target_tilt, minf(1.0, delta * 8.0))
+
+	# проплыла круг и снова в тени — уходит на глубину
+	if travelled >= C.W and vis == V.SHADOW:
+		leaving = true
+	fade = clampf(fade + (-delta if leaving else delta) / 0.6, 0.0, 1.0)
+	if leaving:
+		queue_redraw()
+		return
 
 	vis_timer -= delta
 	if vis_timer <= 0.0:
@@ -158,7 +173,7 @@ func is_visible_threat() -> bool:
 
 
 func is_gone() -> bool:
-	return (dir > 0.0 and base_x > C.W + 180.0) or (dir < 0.0 and base_x < -180.0)
+	return leaving and fade <= 0.0
 
 
 func _ellipse(rx: float, ry: float, col: Color) -> void:
@@ -169,11 +184,17 @@ func _ellipse(rx: float, ry: float, col: Color) -> void:
 	draw_colored_polygon(pts, col)
 
 
+## У шва рисуем акулу дважды — с обеих сторон поля.
 func _draw() -> void:
-	draw_set_transform(Vector2.ZERO, tilt * face, Vector2(face, 1.0))  # морда смотрит туда, куда плывёт
+	for ox in C.ring_copies(position.x, 60.0 * scale.x):
+		_draw_body(Vector2(ox / scale.x, 0.0))
+
+
+func _draw_body(shift: Vector2) -> void:
+	draw_set_transform(shift, tilt * face, Vector2(face, 1.0))  # морда смотрит туда, куда плывёт
 	match vis:
 		V.SHADOW:
-			_ellipse(40, 14, Color(0.02, 0.1, 0.2, 0.35))
+			_ellipse(40, 14, Color(0.02, 0.1, 0.2, 0.35 * fade))
 		V.BUBBLES:
 			_ellipse(40, 14, Color(0.02, 0.1, 0.2, 0.25))
 			for i in 3:
