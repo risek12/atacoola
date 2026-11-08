@@ -44,6 +44,9 @@ var bot_strike_y := 0.0      # где ударит молния, от котор
 var bot_look := 0.0
 var bot_awareness := 0.7
 var bot_greed := 0.5
+var persona := ""            # характер бота (см. BOT_PERSONAS в cfg.gd)
+var bot_dodge_look := 0.0    # таймер проверки «пора уворачиваться рывком»
+var nemesis: Node2D = null   # кто убил этого серфера оружием в последний раз (для мести)
 
 var _font: Font
 
@@ -99,6 +102,15 @@ func streak_mult() -> float:
 	return minf(1.0 + floorf(streak_t / C.STREAK_STEP_TIME) * C.STREAK_STEP_BONUS, C.STREAK_MAX)
 
 
+## Серия выросла на steps ступеней (за убийство соперника), но не выше STREAK_MAX.
+func add_streak_steps(steps: int) -> void:
+	var old := streak_mult()
+	var full := (C.STREAK_MAX - 1.0) / C.STREAK_STEP_BONUS * C.STREAK_STEP_TIME
+	streak_t = minf(streak_t + steps * C.STREAK_STEP_TIME, maxf(streak_t, full))
+	if streak_mult() > old:
+		game.on_streak_up(self)
+
+
 ## Бессмертен: кубок или идёт рывок.
 func is_invulnerable() -> bool:
 	return invuln > 0.0 or dash_t > 0.0
@@ -147,6 +159,8 @@ func die() -> float:
 
 ## Новая жизнь: серфер снова на своём лежаке, счётчик касаний вала обнулён.
 func _respawn() -> void:
+	if not is_bot:
+		game.sfx.play("respawn", 0.0, 0.0)
 	state = S.LOUNGER
 	position = Vector2(C.lane_x(lane), C.LOUNGER_Y)
 	returning = false
@@ -179,7 +193,10 @@ func tick(delta: float) -> void:
 			if respawn_timer <= 0.0:
 				_respawn()
 		return
+	var was_charging := dash_cd > 0.0
 	dash_cd = maxf(dash_cd - delta, 0.0)
+	if was_charging and dash_cd <= 0.0 and not is_bot and state == S.WATER:
+		game.sfx.play("dash_ready", -4.0, 0.0)  # шкала рывка заполнилась
 	dash_t = maxf(dash_t - delta, 0.0)
 	invuln = maxf(invuln - delta, 0.0)
 	if is_bot:
@@ -223,7 +240,10 @@ func tick(delta: float) -> void:
 				_reset_swim()
 
 	# Касание вала: мигаем красным, а за WALL_TOUCH_LIMIT секунд в сумме — проигрыш
+	var was_touching := touching_wall
 	touching_wall = state == S.WATER and position.y <= game.wall_y + C.WALL_GAP + 1.5 and not is_invulnerable()
+	if touching_wall and not was_touching and not is_bot:
+		game.sfx.play("wall_alarm", 0.0, 0.0)
 	if touching_wall:
 		wall_touch_time += delta
 		modulate = Color(1, 0.25, 0.25) if int(wall_touch_time * 10.0) % 2 == 0 else Color.WHITE
@@ -252,9 +272,33 @@ func _arrive_lounger() -> void:
 	bot_rest = randf_range(0.3, 1.0)
 
 
+## Характер бота: меняет жадность, внимательность и любимые зоны.
+func set_persona(p: String) -> void:
+	persona = p
+	match p:
+		"coward":
+			bot_greed = 0.2
+			bot_awareness = randf_range(0.85, 0.95)
+		"greedy":
+			bot_greed = 1.0
+			bot_awareness = randf_range(0.5, 0.65)
+		"hunter":
+			bot_greed = 0.8
+			bot_awareness = randf_range(0.7, 0.8)
+		"collector":
+			bot_greed = 0.6
+			bot_awareness = randf_range(0.7, 0.8)
+	_plan_trip()
+
+
 func _plan_trip() -> void:
 	# Цель — одна из зон x8…x128; чем жаднее бот, тем чаще он лезет в хардкорные зоны.
 	bot_target_zone = clampi(3 + int(randf() * (0.6 + 0.4 * bot_greed) * 5.0), 3, C.ZONES - 1)
+	match persona:
+		"coward": bot_target_zone = randi_range(3, 4)      # x8–x16
+		"greedy": bot_target_zone = randi_range(6, 7)      # x64–x128
+		"hunter": bot_target_zone = randi_range(5, 7)      # x32–x128
+		"collector": bot_target_zone = randi_range(4, 6)   # x16–x64
 	bot_target_off = lerpf(112.0, 87.0, bot_greed) + randf_range(-4.5, 4.5)
 	bot_trip_time = 0.0
 	bot_trip_len = randf_range(10.0, 25.0)
@@ -280,6 +324,14 @@ func _bot_think(delta: float) -> void:
 		S.BEACH:
 			holding = bot_going_out
 		S.WATER:
+			# угроза вот-вот ударит — уворачиваемся рывком (реакция не идеальная)
+			bot_dodge_look -= delta
+			if bot_dodge_look <= 0.0:
+				bot_dodge_look = C.BOT_DODGE_CHECK
+				if dash_cd <= 0.0 and randf() < bot_awareness * C.BOT_DODGE_CHANCE:
+					var dodge: float = game.bot_dodge_dir(self)
+					if dodge != 0.0:
+						dash(dodge)
 			bot_look -= delta
 			if bot_look <= 0.0:
 				bot_look = 0.25
@@ -311,6 +363,11 @@ func _bot_think(delta: float) -> void:
 					var gold_mid := (span.x + span.y) * 0.5
 					if bot_greed > 0.85 or absf(gold_mid - target_y) < 300.0:
 						target_y = gold_mid
+				# охотник с ракетами держится на одной линии с добычей
+				if persona == "hunter" and rockets > 0:
+					var prey: Node2D = game.bot_prey(self)
+					if prey and prey.position.y > game.wall_y + C.WALL_GAP + 60.0:
+						target_y = prey.position.y
 				holding = position.y > target_y
 				bot_trip_time += delta
 				if bot_trip_time >= bot_trip_len:
@@ -356,6 +413,10 @@ func _draw() -> void:
 		# бессмертие от кубка: золотое сияние (мигает в последнюю секунду)
 		draw_circle(Vector2.ZERO, 34, Color(1, 0.85, 0.2, 0.25))
 		draw_arc(Vector2.ZERO, 36, 0, TAU, 32, Color(1, 0.85, 0.2, 0.9), 3.0)
+	if game.leader == self:
+		draw_crown(self, Vector2(0, -80), 1.0)
+	if is_bot and game.player and game.player.nemesis == self:
+		_draw_nemesis_mark()  # этот серфер последним убил игрока
 	if dash_t > 0.0:
 		# рывок: голубой щит — сейчас ничто не страшно
 		draw_circle(Vector2.ZERO, 34, Color(0.5, 0.9, 1.0, 0.25))
@@ -425,3 +486,24 @@ func _draw_rocket_icons() -> void:
 		draw_colored_polygon(PackedVector2Array([Vector2(x + w - 6, y - 3), Vector2(x + w, y), Vector2(x + w - 6, y + 3)]), Color(0.95, 0.25, 0.15))
 		draw_colored_polygon(PackedVector2Array([Vector2(x, y - 2), Vector2(x - 4, y), Vector2(x, y + 2)]), Color(1, 0.6, 0.1))
 
+
+## Корона лидера раунда (рисуется над серфером, а если он погиб — над его лежаком).
+static func draw_crown(ci: CanvasItem, c: Vector2, k: float) -> void:
+	var pts := PackedVector2Array([
+		c + Vector2(-16, 8) * k, c + Vector2(-18, -10) * k, c + Vector2(-8, -1) * k,
+		c + Vector2(0, -14) * k, c + Vector2(8, -1) * k, c + Vector2(18, -10) * k, c + Vector2(16, 8) * k])
+	ci.draw_colored_polygon(pts, Color(1.0, 0.82, 0.2))
+	pts.append(pts[0])
+	ci.draw_polyline(pts, Color(0.45, 0.28, 0.0), 2.0 * k)
+	for p in [Vector2(-18, -10), Vector2(0, -14), Vector2(18, -10)]:
+		ci.draw_circle(c + p * k, 2.6 * k, Color(1.0, 0.3, 0.35))
+
+
+## Метка «враг»: этот серфер последним убил игрока — пульсирующее красное кольцо с рисками прицела.
+func _draw_nemesis_mark() -> void:
+	var pulse := 0.6 + 0.4 * sin(Time.get_ticks_msec() * 0.01)
+	var col := Color(1.0, 0.15, 0.15, pulse)
+	draw_arc(Vector2.ZERO, 38, 0, TAU, 36, col, 3.0)
+	for i in 4:
+		var d := Vector2.from_angle(TAU * i / 4.0 + PI * 0.25)
+		draw_line(d * 32.0, d * 44.0, col, 3.0)

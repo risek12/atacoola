@@ -3,6 +3,7 @@ extends Node2D
 
 const C = preload("res://scripts/cfg.gd")
 const SurferScript = preload("res://scripts/surfer.gd")
+const SfxScript = preload("res://scripts/sfx.gd")
 const SharkScript = preload("res://scripts/shark.gd")
 const ChestScript = preload("res://scripts/chest.gd")
 const BigSharkScript = preload("res://scripts/big_shark.gd")
@@ -11,6 +12,9 @@ enum State { COUNTDOWN, PLAYING, RESULTS }
 
 var state: int = State.COUNTDOWN
 var countdown := 3.0
+var sfx: Node            # звуки (scripts/sfx.gd)
+var last_tick := -1      # последняя «тикнувшая» секунда отсчёта
+var big_phase := ""      # фаза большой акулы, чтобы звучать при её смене
 var message_timer := 0.0
 var round_time := 0.0
 var difficulty := 0.0  # 0 — начало раунда, 1 — пик (см. DIFFICULTY_PEAK_TIME)
@@ -73,6 +77,8 @@ var font: Font
 
 func _ready() -> void:
 	font = ThemeDB.fallback_font
+	sfx = SfxScript.new()
+	add_child(sfx)
 	overlay = Node2D.new()
 	overlay.z_index = 10
 	add_child(overlay)
@@ -82,10 +88,14 @@ func _ready() -> void:
 	add_child(beach_layer)
 	beach_layer.draw.connect(_draw_beach)
 	restart_button.pressed.connect(start_round)
+	restart_button.pressed.connect(sfx.play.bind("click"))
 	bomb_button.pressed.connect(_on_bomb_button)
 	rocket_button.pressed.connect(_on_buy_rocket)
 	_load_coins()
 	start_round()
+
+
+var leader: Node2D = null  # у кого больше всех очков — носит корону
 
 
 func start_round() -> void:
@@ -110,6 +120,15 @@ func start_round() -> void:
 		surfers.append(s)
 		if i == C.PLAYER_LANE:
 			player = s
+	# характеры ботов — по одному каждого, в случайном порядке
+	var personas := C.BOT_PERSONAS.duplicate()
+	personas.shuffle()
+	for s in surfers:
+		if s.is_bot:
+			s.set_persona(personas.pop_back())
+	leader = null
+	last_tick = -1
+	big_phase = ""
 
 	round_time = 0.0
 	difficulty = 0.0
@@ -149,11 +168,20 @@ func _process(delta: float) -> void:
 			countdown -= delta
 			if countdown > 0.0:
 				countdown_label.text = str(ceili(countdown))
+				if ceili(countdown) != last_tick:
+					last_tick = ceili(countdown)
+					sfx.play("tick", 0.0, 0.0)
 			else:
 				state = State.PLAYING
 				_show_message("GO!", 0.8, 165)
+				sfx.play("go", 0.0, 0.0)
 		State.PLAYING:
 			_update_round(delta)
+			# последние 10 секунд — тиканье
+			var left := ceili(C.ROUND_TIME - round_time)
+			if state == State.PLAYING and left <= 10 and left > 0 and left != last_tick:
+				last_tick = left
+				sfx.play("tick_final", -4.0, 0.0)
 		State.RESULTS:
 			_update_fireworks(delta)
 
@@ -252,6 +280,8 @@ func _update_round(delta: float) -> void:
 
 	for s in surfers:
 		s.tick(delta)
+	_update_leader()
+	_bot_buy_rockets()
 	for sh in sharks.duplicate():
 		sh.tick(delta)
 		# проплыла круг и ушла на глубину или её зону вытеснили — убираем
@@ -287,6 +317,21 @@ func _update_zones() -> void:
 	zone_y[0] = C.SHORE_Y
 
 
+## Лидер — у кого больше всех очков. Корона переходит, только когда его обогнали.
+func _update_leader() -> void:
+	var best: Node2D = null
+	for s in surfers:
+		if s.score >= 1.0 and (best == null or s.score > best.score):
+			best = s
+	if best == null or best == leader:
+		return
+	if leader == null or best.score > leader.score:
+		leader = best
+		if leader == player and state == State.PLAYING:
+			_add_floater(player.position + Vector2(0, -120), "Ты лидер!", Color(1, 0.85, 0.2))
+			sfx.play("leader")
+
+
 ## Серфер воскрес — убираем метку его прошлой гибели.
 func on_respawn(s: Node2D) -> void:
 	death_marks = death_marks.filter(func(d): return d["lane"] != s.lane)
@@ -295,11 +340,13 @@ func on_respawn(s: Node2D) -> void:
 ## Серия выросла — подсказываем игроку.
 func on_streak_up(s: Node2D) -> void:
 	if s == player:
+		sfx.play("streak", 0.0, 0.0)
 		_add_floater(s.position + Vector2(0, -90), "Серия ×%s!" % String.num(s.streak_mult(), 2), Color(1, 0.75, 0.2))
 
 
 ## Рывок: брызги в стороны.
 func on_dash(s: Node2D) -> void:
+	sfx.play("dash", sfx.vol_for(s == player))
 	for k in 12:
 		var vel := Vector2(randf_range(-1.0, 1.0) * 260.0, randf_range(-80.0, 80.0) + s.dash_v * 0.15)
 		sparks.append({"pos": s.position, "vel": vel, "life": 0.35, "color": Color(0.85, 0.97, 1.0)})
@@ -337,6 +384,7 @@ func _update_gold(delta: float) -> void:
 	if not gold_times.is_empty() and round_time >= gold_times[0]:
 		gold_times.pop_front()
 		gold_timer = C.GOLD_DURATION
+		sfx.play("gold", 0.0, 0.0)
 		var room := C.SHORE_Y - wall_y - gold_height()
 		gold_off = randf_range(0.0, maxf(room, 0.0))
 		_add_floater(Vector2(C.W * 0.5, wall_y + gold_off + gold_height() * 0.5), "ЗОЛОТАЯ ЗОНА x%d!" % C.GOLD_POINTS, C.GOLD_COLOR)
@@ -377,6 +425,7 @@ func _update_tornadoes(delta: float, progress: float) -> void:
 		# поле кольцевое: торнадо появляется в случайном месте полосы и проходит один круг
 		var dir := 1.0 if randf() < 0.5 else -1.0
 		tornadoes.append({"x": randf_range(0.0, C.W), "dir": dir, "warn": C.TORNADO_WARN, "path": 0.0})
+		sfx.play("tornado_warn", -10.0)
 	# полёт и гибель тех, кого задело
 	var ty := tornado_y()
 	for t in tornadoes.duplicate():
@@ -398,6 +447,13 @@ func _update_tornadoes(delta: float, progress: float) -> void:
 func _update_big_shark(delta: float) -> void:
 	if big_shark:
 		big_shark.tick(delta)
+		var phase := "jump" if big_shark.is_jumping() else ("warn" if big_shark.is_warning() else "calm")
+		if phase != big_phase:
+			big_phase = phase
+			if phase == "warn":
+				sfx.play("big_warn", -4.0, 0.0)
+			elif phase == "jump":
+				sfx.play("big_jump", 0.0, 0.0)
 		if big_shark.is_jumping():
 			for s in surfers:
 				if s.in_water() and big_shark.in_hit_zone(s.position):
@@ -448,6 +504,7 @@ func _update_lightning(delta: float) -> void:
 			target.y = clampf(target.y, area.x, area.y)
 			target.x = C.wrap_x(target.x)
 		strikes.append({"target": target, "t": 0.0})
+		sfx.play("zap", -8.0)
 	# удары
 	for st in strikes.duplicate():
 		st["t"] += delta
@@ -459,6 +516,7 @@ func _update_lightning(delta: float) -> void:
 			if s.in_water() and C.ring_dist(s.position, pos) < C.LIGHTNING_RADIUS:
 				_eliminate(s, "Бах!", "Тебя ударило\nмолнией!")
 		flashes.append({"target": pos, "life": 0.3})
+		sfx.play("thunder", -3.0)
 		for k in 20:  # искры
 			var vel := Vector2.from_angle(TAU * k / 20.0) * randf_range(150.0, 350.0)
 			sparks.append({"pos": pos, "vel": vel, "life": 0.5, "color": C.LIGHTNING_COLOR})
@@ -499,6 +557,7 @@ func _update_bomb_button() -> void:
 
 ## Нажатие на кнопку: включает выбор места (повторное нажатие — отмена).
 func _on_bomb_button() -> void:
+	sfx.play("click", 0.0, 0.0)
 	aiming = not aiming
 	aim_shown = false
 	aim_held = false
@@ -545,6 +604,7 @@ func _throw_bomb(thrower: Node2D, target: Vector2) -> void:
 	thrower.bomb_cd = C.BOMB_COOLDOWN
 	target.x = C.wrap_x(target.x)  # поле кольцевое
 	bombs.append({"target": target, "t": 0.0, "reward": cost * mult, "thrower": thrower})
+	sfx.play("bomb_throw", sfx.vol_for(thrower == player) + 2.0)
 	_add_floater(Vector2(C.lane_x(thrower.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "−%d" % cost, Color(1, 0.6, 0.3))
 
 
@@ -561,7 +621,17 @@ func _bot_bombs(delta: float) -> void:
 		var targets := surfers.filter(func(s): return s != bot and s.in_water())
 		if targets.is_empty():
 			continue
-		var victim = targets.pick_random()
+		# чаще целятся в лидера, во «врага» и в тех, у кого разогнана серия
+		var total := 0.0
+		for t in targets:
+			total += _prey_weight(bot, t)
+		var roll := randf() * total
+		var victim = targets[0]
+		for t in targets:
+			roll -= _prey_weight(bot, t)
+			if roll <= 0.0:
+				victim = t
+				break
 		var lead := Vector2(0.0, victim.velocity_y() * C.BOMB_FALL_TIME)
 		var miss := Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)) * C.BOT_BOMB_AIM_ERROR
 		var target: Vector2 = victim.position + lead + miss
@@ -580,20 +650,21 @@ func _update_bombs(delta: float) -> void:
 		bombs.erase(b)
 		var pos: Vector2 = b["target"]
 		var thrower: Node2D = b["thrower"]
-		var hits := 0
+		var reward := 0.0
 		for s in surfers:
 			if s != thrower and s.in_water() and C.ring_dist(s.position, pos) < C.BOMB_RADIUS:
-				_eliminate(s, "Бум!", "Тебя подорвал\n%s!" % thrower.display_name)
-				hits += 1
-		if hits > 0:
-			var reward: int = b["reward"] * hits
-			thrower.score += reward
-			_add_floater(Vector2(C.lane_x(thrower.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "Попал! +%d" % reward, Color(0.4, 1.0, 0.4))
+				var mult := _weapon_kill_mult(thrower, s)
+				if _eliminate(s, "Бум!", "Тебя подорвал\n%s!" % thrower.display_name, thrower):
+					reward += b["reward"] * mult
+		if reward > 0.0:
+			thrower.score += int(reward)
+			_add_floater(Vector2(C.lane_x(thrower.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "Попал! +%d" % int(reward), Color(0.4, 1.0, 0.4))
 		# на месте взрыва — ник того, кто бросил
 		_add_floater(pos + Vector2(0, -C.BOMB_RADIUS * 0.6), "Бомба: %s" % thrower.display_name, Color(1, 0.6, 0.2))
 		for k in 28:  # вспышка взрыва
 			var vel := Vector2.from_angle(TAU * k / 28.0) * randf_range(120.0, 300.0)
 			sparks.append({"pos": pos, "vel": vel, "life": 0.6, "color": Color(1.0, randf_range(0.3, 0.7), 0.1)})
+		sfx.play("explosion", -2.0)
 
 
 ## Множитель очков в точке: зона x1…x128, а внутри золотой зоны — всегда x256.
@@ -684,11 +755,52 @@ func wash_away(s: Node2D) -> void:
 	_eliminate(s, "Смыло!", "Тебя смыло волной!")
 
 
-func _eliminate(s: Node2D, floater_text: String, player_message: String) -> void:
+## Множитель награды за убийство оружием: лидер ×2, месть ×1,5 (перемножаются).
+## Заодно показывает надписи «Лидер сбит!» и «Месть!».
+func _weapon_kill_mult(killer: Node2D, victim: Node2D) -> float:
+	if victim.is_invulnerable():
+		return 0.0
+	var mult := 1.0
+	if victim == leader:
+		mult *= C.LEADER_REWARD_MULT
+		_add_floater(victim.position + Vector2(0, -150), "Лидер сбит!", Color(1, 0.85, 0.2))
+		sfx.play("leader", sfx.vol_for(killer == player))
+	if killer.nemesis == victim:
+		mult *= C.REVENGE_REWARD_MULT
+		killer.nemesis = null
+		_add_floater(victim.position + Vector2(0, -100), "Месть!", Color(1, 0.35, 0.3))
+		sfx.play("revenge", sfx.vol_for(killer == player))
+	return mult
+
+
+## Звук гибели: по причине (у взрывов и молнии свой звук уже прозвучал) и отдельный — если погиб игрок.
+func _death_sound(s: Node2D, cause: String) -> void:
+	var v: float = sfx.vol_for(s == player)
+	match cause:
+		"Ам!", "Ам!!!":
+			sfx.play("bite", v)
+		"Вжух!":
+			sfx.play("tornado_hit", v)
+		"Смыло!":
+			sfx.play("splash", v)
+	if s == player:
+		sfx.play("player_die", 0.0, 0.0)
+
+
+## Гибель серфера. killer — кто убил оружием (для мести). Возвращает false, если серфер бессмертен.
+func _eliminate(s: Node2D, floater_text: String, player_message: String, killer: Node2D = null) -> bool:
 	if s.is_invulnerable():
-		return  # бессмертие от кубка или рывка — никакие угрозы не страшны
+		return false  # бессмертие от кубка или рывка — никакие угрозы не страшны
+	var steal := 0  # сколько ступеней серии заберёт убийца
+	if killer:
+		s.nemesis = killer
+		if killer.in_water():
+			steal = C.STREAK_STEAL_STEPS_RICH if s.streak_mult() >= C.STREAK_STEAL_RICH else C.STREAK_STEAL_STEPS
 	death_marks.append({"lane": s.lane, "x": s.position.x, "off": s.position.y - wall_y})
 	var lost: float = s.die()
+	if steal > 0:
+		killer.add_streak_steps(steal)
+	_death_sound(s, floater_text)
 	var text := floater_text if lost < 1.0 else "%s −%d" % [floater_text, int(lost)]
 	_add_floater(s.position, text, Color(1, 0.3, 0.3))
 	if s == player:
@@ -696,6 +808,7 @@ func _eliminate(s: Node2D, floater_text: String, player_message: String) -> void
 			_show_message("%s\nВозврат через %d с" % [player_message, int(C.RESPAWN_DELAY)], 2.0)
 		else:
 			_show_message("%s\nЖизни кончились" % player_message, 2.5)
+	return true
 
 
 # ---------------- Ракеты ----------------
@@ -720,6 +833,7 @@ func _on_buy_rocket() -> void:
 		return
 	player.score -= C.ROCKET_COST
 	player.rockets += 1
+	sfx.play("buy", 0.0, 0.0)
 	_add_floater(Vector2(C.lane_x(player.lane), C.LOUNGER_Y - 60.0 + beach_dy()), "Ракета! −%d" % C.ROCKET_COST, Color(1, 0.6, 0.3))
 
 
@@ -729,28 +843,128 @@ func _fire_rocket(s: Node2D, dir: float) -> void:
 		return
 	if s.rockets <= 0:
 		_add_floater(s.position + Vector2(0, -60), "Нет ракет", Color(0.85, 0.85, 0.85))
+		sfx.play("no_ammo", 0.0, 0.0)
 		return
 	s.rockets -= 1
 	var start := s.position + Vector2(dir * 45.0, 0.0)
 	start.x = C.wrap_x(start.x)
 	rocket_shots.append({"pos": start, "dir": dir, "owner": s, "path": 45.0})
+	sfx.play("rocket_launch", sfx.vol_for(s == player))
 
 
-## Боты стреляют ракетой в соперника, который плывёт на одной линии с ними
-## в пределах 2 дорожек (в том числе через шов поля).
+## Насколько боту хочется сбить этого соперника: лидер и «враг» — втрое, разогнанная серия — тоже.
+func _prey_weight(bot: Node2D, s: Node2D) -> float:
+	var w: float = 1.0 + (s.streak_mult() - 1.0) * 2.0
+	if s == leader:
+		w *= 3.0
+	if bot.nemesis == s:
+		w *= 3.0
+	return w
+
+
+## Для охотника: самый «ценный» соперник в воде.
+func bot_prey(bot: Node2D) -> Node2D:
+	var best: Node2D = null
+	var best_w := 0.0
+	for s in surfers:
+		if s == bot or not s.in_water() or s.is_invulnerable():
+			continue
+		var w := _prey_weight(bot, s)
+		if w > best_w:
+			best = s
+			best_w = w
+	return best
+
+
+## Боты стреляют ракетами: в соперника — с упреждением (куда он доплывёт, пока летит ракета),
+## выбирая самого ценного; в кусающую акулу на своей линии — для защиты.
 func _bot_rockets(delta: float) -> void:
 	for bot in surfers:
 		if bot == player or not bot.in_water() or bot.rockets <= 0:
 			continue
-		if randf() >= C.BOT_ROCKET_CHANCE * delta:
+		var chance := C.BOT_ROCKET_CHANCE * (2.0 if bot.persona == "hunter" else 1.0)
+		if randf() >= chance * delta:
 			continue
+		var best_dir := 0.0
+		var best_w := 0.0
 		for s in surfers:
-			if s == bot or not s.in_water() or absf(s.position.y - bot.position.y) > 40.0:
+			if s == bot or not s.in_water() or s.is_invulnerable():
 				continue
 			var dx := C.wrap_dx(s.position.x, bot.position.x)
-			if absf(dx) <= C.ROCKET_RANGE:
-				_fire_rocket(bot, signf(dx))
+			if absf(dx) > C.ROCKET_RANGE:
+				continue
+			var fly_time := absf(dx) / C.ROCKET_SPEED
+			var future_y: float = s.position.y + s.velocity_y() * fly_time
+			if absf(future_y - bot.position.y) > C.BOT_ROCKET_AIM:
+				continue
+			var w := _prey_weight(bot, s)
+			if w > best_w:
+				best_w = w
+				best_dir = signf(dx)
+		if best_dir == 0.0:
+			# защита: кусающая акула плывёт на бота по его линии
+			for sh in sharks:
+				var sdx := C.wrap_dx(sh.position.x, bot.position.x)
+				if sh.bites_soon(0.5) and absf(sh.position.y - bot.position.y) < 30.0 \
+						and absf(sdx) < 260.0 and signf(sdx) != sh.dir:
+					best_dir = signf(sdx)
+					break
+		if best_dir != 0.0:
+			_fire_rocket(bot, best_dir)
+
+
+## Боты на берегу докупают ракеты: охотник — всегда, остальные — если очков с запасом.
+func _bot_buy_rockets() -> void:
+	for bot in surfers:
+		if not bot.is_bot or not bot.is_alive() or bot.in_water() or bot.rockets >= C.ROCKET_MAX:
+			continue
+		var reserve := 1.0 if bot.persona == "hunter" else 3.0
+		if bot.score >= C.ROCKET_COST * reserve:
+			bot.score -= C.ROCKET_COST
+			bot.rockets += 1
+
+
+## Для ботов: куда рвануть, если прямо сейчас что-то ударит. −1 — вверх, +1 — вниз, 0 — угрозы нет.
+func bot_dodge_dir(s: Node2D) -> float:
+	var p: Vector2 = s.position
+	var threat := Vector2.INF
+	for sh in sharks:
+		if sh.bites_soon(0.3) and C.ring_dist(sh.position, p) < C.BITE_RADIUS + 35.0:
+			threat = sh.position
+			break
+	if threat == Vector2.INF:
+		for b in bombs:
+			if b["t"] > C.BOMB_FALL_TIME - 0.35 and b["thrower"] != s and C.ring_dist(b["target"], p) < C.BOMB_RADIUS + 10.0:
+				threat = b["target"]
 				break
+	if threat == Vector2.INF:
+		for st in strikes:
+			if st["t"] > C.LIGHTNING_WARN - 0.35 and C.ring_dist(st["target"], p) < C.LIGHTNING_RADIUS + 10.0:
+				threat = st["target"]
+				break
+	if threat == Vector2.INF and big_shark and (big_shark.is_jumping() or (big_shark.is_warning() and big_shark.vis_timer < 0.3)):
+		if big_shark.in_hit_zone(p):
+			threat = big_shark.position
+	if threat == Vector2.INF:
+		for r in rocket_shots:
+			var rdx := C.wrap_dx(p.x, r["pos"].x)
+			if r["owner"] != s and absf(r["pos"].y - p.y) < C.ROCKET_HIT + 10.0 and rdx * r["dir"] > 0.0 and absf(rdx) < 220.0:
+				threat = r["pos"]
+				break
+	if threat == Vector2.INF and tornado_band_alive():
+		var ty := tornado_y()
+		if absf(p.y - ty) < C.TORNADO_BAND * 0.5 + 21.0:
+			for t in tornadoes:
+				var ahead: float = C.wrap_dx(p.x, t["x"]) * t["dir"]
+				if t["warn"] <= 0.0 and ahead > -C.TORNADO_RADIUS and ahead < C.TORNADO_RADIUS + tornado_speed() * 0.3:
+					threat = Vector2(t["x"], ty)
+					break
+	if threat == Vector2.INF:
+		return 0.0
+	# у вала — только вниз; иначе — прочь от угрозы по вертикали
+	if p.y < wall_y + C.WALL_GAP + 190.0:
+		return 1.0
+	return -1.0 if threat.y >= p.y else 1.0
 
 
 ## Полёт ракет: первая активная акула или соперник на пути — уничтожены, ракета тоже.
@@ -777,10 +991,12 @@ func _update_rockets(delta: float) -> void:
 		if not hit:
 			for s in surfers:
 				if s != shooter and s.in_water() and C.ring_dist(s.position, pos) < C.ROCKET_HIT:
-					_eliminate(s, "Ракета!", "Тебя сбил ракетой\n%s!" % shooter.display_name)
+					_weapon_kill_mult(shooter, s)  # надписи «Лидер сбит!» / «Месть!»
+					_eliminate(s, "Ракета!", "Тебя сбил ракетой\n%s!" % shooter.display_name, shooter)
 					hit = true
 					break
 		if hit:
+			sfx.play("rocket_hit", sfx.vol_for(shooter == player) + 3.0)
 			for k in 16:  # взрыв
 				var vel := Vector2.from_angle(TAU * k / 16.0) * randf_range(120.0, 260.0)
 				sparks.append({"pos": pos, "vel": vel, "life": 0.5, "color": Color(1.0, randf_range(0.4, 0.8), 0.2)})
@@ -818,7 +1034,11 @@ func _update_pickups(delta: float) -> void:
 			if bots.is_empty():
 				_remove_pickup(pk)
 			else:
-				_collect(pk, bots.pick_random())
+				var collectors := bots.filter(func(s): return s.persona == "collector")
+				if not collectors.is_empty() and randf() < C.BOT_COLLECTOR_SHARE:
+					_collect(pk, collectors[0])
+				else:
+					_collect(pk, bots.pick_random())
 
 
 ## Серфер забрал предмет: сундук — очки, кубок — бессмертие.
@@ -826,10 +1046,12 @@ func _collect(pk: Node2D, s: Node2D) -> void:
 	if pk.kind == "trophy":
 		s.invuln = C.TROPHY_INVULN
 		_add_floater(pk.position, "%s: бессмертие %d с!" % [s.display_name, int(C.TROPHY_INVULN)], Color(1, 0.9, 0.3))
+		sfx.play("trophy", sfx.vol_for(s == player), 0.0)
 	else:
 		var reward := chest_reward()
 		s.score += reward
 		_add_floater(pk.position, "%s +%d" % [s.display_name, reward], Color(1, 0.85, 0.2))
+		sfx.play("coins", sfx.vol_for(s == player))
 	_remove_pickup(pk)
 
 
@@ -867,6 +1089,8 @@ func _end_round() -> void:
 			coins += prize
 			_save_coins()
 
+	sfx.play("win" if ranking[0] == player else "lose", 0.0, 0.0)
+	sfx.play("end_gong", -6.0, 0.0)
 	if int(ranking[0].score) > 0:
 		winner_lane = ranking[0].lane
 	result_label.text = "\n".join(lines)
@@ -1059,6 +1283,9 @@ func _draw_beach() -> void:
 	# лежаки со счётом
 	for s in surfers:
 		var cx := C.lane_x(s.lane)
+		# лежак крупнее на OBJECT_SCALE — масштабируем вокруг его центра
+		var pivot := Vector2(cx, ly + 67)
+		b.draw_set_transform(pivot * (1.0 - C.OBJECT_SCALE), 0.0, Vector2.ONE * C.OBJECT_SCALE)
 		var r := Rect2(cx - 78, ly + 15, 156, 105)
 		b.draw_rect(r, Color(0.9, 0.62, 0.23) if s == player else Color(0.79, 0.42, 0.23))
 		b.draw_rect(r, Color(0, 0, 0, 0.5), false, 4.5)
@@ -1074,6 +1301,11 @@ func _draw_beach() -> void:
 			b.draw_string(font, Vector2(cx - 33, ly + 3), str(ceili(s.respawn_timer)), HORIZONTAL_ALIGNMENT_CENTER, 66, 42, Color.WHITE)
 		elif s.is_out():
 			b.draw_rect(r, Color(0, 0, 0, 0.45))  # выбыл — лежак затемнён
+		if s == player.nemesis:
+			b.draw_rect(r.grow(4.0), Color(1, 0.15, 0.15, 0.9), false, 5.0)  # лежак «врага»
+		if s == leader and not s.visible:
+			SurferScript.draw_crown(b, Vector2(cx, ly - 40), 2.0)  # лидер погиб — корона над лежаком
+	b.draw_set_transform(Vector2.ZERO)
 
 
 func _draw_wave_line(ci: CanvasItem, y: float, amp: float, col: Color, width: float, phase: float) -> void:
@@ -1105,8 +1337,9 @@ func _draw_bomb(b: Dictionary) -> void:
 		overlay.draw_arc(target, ring, 0, TAU, 40, Color(1, 0.1, 0.05, 0.6 + 0.4 * k), 6.0)
 	overlay.draw_circle(target, 6, Color(1, 0.2, 0.1))
 	var pos := Vector2(target.x, lerpf(-60.0, target.y, k * k))
-	overlay.draw_circle(pos, 18, Color(0.1, 0.1, 0.1))
-	overlay.draw_circle(pos + Vector2(9, -18), 4.5, Color(1, 0.7, 0.1))
+	var k2 := C.OBJECT_SCALE
+	overlay.draw_circle(pos, 18 * k2, Color(0.1, 0.1, 0.1))
+	overlay.draw_circle(pos + Vector2(9, -18) * k2, 4.5 * k2, Color(1, 0.7, 0.1))
 
 
 ## Подсказка в режиме прицеливания: пляж затемнён, сверху надпись.
@@ -1198,10 +1431,12 @@ func _draw_rockets() -> void:
 
 
 func _draw_rocket(p: Vector2, d: float) -> void:
+	overlay.draw_set_transform(p * (1.0 - C.OBJECT_SCALE), 0.0, Vector2.ONE * C.OBJECT_SCALE)
 	overlay.draw_rect(Rect2(p.x - 22.0, p.y - 8.0, 44.0, 16.0), Color(0.85, 0.85, 0.9))
 	overlay.draw_colored_polygon(PackedVector2Array([Vector2(p.x + d * 22.0, p.y - 8.0), Vector2(p.x + d * 40.0, p.y), Vector2(p.x + d * 22.0, p.y + 8.0)]), Color(0.9, 0.2, 0.15))
 	var flame := 18.0 + randf() * 14.0
 	overlay.draw_colored_polygon(PackedVector2Array([Vector2(p.x - d * 22.0, p.y - 7.0), Vector2(p.x - d * (22.0 + flame), p.y), Vector2(p.x - d * 22.0, p.y + 7.0)]), Color(1, 0.6, 0.1, 0.9))
+	overlay.draw_set_transform(Vector2.ZERO)
 
 
 func _draw_overlay() -> void:

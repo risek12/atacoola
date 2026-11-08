@@ -168,6 +168,11 @@ func can_bite() -> bool:
 	return vis == V.FULL
 
 
+## Укусит в ближайшие t секунд (для ботов: пора ли уворачиваться).
+func bites_soon(t: float) -> bool:
+	return vis == V.FULL or (vis == V.FIN and vis_timer < t)
+
+
 func is_visible_threat() -> bool:
 	return vis != V.SHADOW
 
